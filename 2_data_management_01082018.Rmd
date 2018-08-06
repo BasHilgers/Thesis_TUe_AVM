@@ -1,0 +1,405 @@
+---
+title: "PHASE 2: DATA MANAGEMENT"
+subtitle: "Thesis TUe - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+
+---
+
+# 1. INTRODUCTION
+
+<br>
+
+Phase 2 deals with the **Data Management** of the database that is at the base of the AVM. In the code below we import the raw, downloaded tabular data into a database format, add unique identifiers etcetera. For the geo-spatial data we convert the shapefiles to R data objects and re-project the coordinates to match a standard coordinate reference system (CRS) format. 
+
+*Note*: The previous data-gathering phase and the data-management is an iterative process! That is, data is gathered, managed and stored. Missing or uncorrect data is then filtered in the data-management phase and new data is gathered for this and again managed and stored, etc. Vizualizing the data in a form format, e.g. Access can help with the inspection of the raw data and user data input.
+
+We begin the process by loading a number of packages or libraries that are needed in this. We also set our directories.
+
+```{r set-options, message=FALSE, warning=FALSE}
+
+  ## load libraries
+  library(knitr)      # publication options markdown
+  library(RODBC)      # Access database
+  library(tidyverse)  # Toolkit
+  library(plyr)       # Data manipulation / spatial dataframe
+
+  ## Set data and code directory
+  wd.dir   <- file.path('C:/Users/bashi/Desktop/TUe Thesis')
+  data.dir <- file.path(wd.dir, '5 Data', 'AVM database')
+  code.dir <- file.path(wd.dir, '6 Modelling', 'modules')
+
+  ## file options
+  options(width=120) # control width output
+  knitr::opts_chunk$set(out.width='800px', dpi=200) # control width figures
+  options(scipen=999)
+  options(stringsAsFactors = FALSE)
+  
+```
+
+We also load in a set of custom functions that have been developed to help with the data management process.
+
+```{r}
+
+  # confidential
+  # source(file.path(code.dir, 'custom_functions_data_management.R'))
+
+```
+
+<br>
+
+---
+
+# 2. DATABASE CONNECTION
+
+<br>
+
+First, we connect to our Access database and load the full data into memory to work with.
+
+```{r}
+
+  ## establish db connection
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+
+  ## Read in data
+  df_XL <- sqlFetch(db.conn, "tbl2_data_managed")
+
+```
+
+Preview data.
+
+```{r}
+
+  #head(df_XL)
+  names(df_XL)
+  #str(df_XL, list.len=ncol(df_XL))
+
+```
+
+<br>
+
+---
+
+# 3. DATA MANAGEMENT
+
+<br>
+
+We load the gathered data into memory.
+
+```{r eval=FALSE}
+
+  ## Read in sales data
+  df_gathered <- sqlFetch(db.conn, "tbl1_data_gathered")
+  
+```
+
+Next we merge this data to the AVM database. *Note*: all old values are replaced by the new gathered data!
+
+```{r eval=FALSE}
+  
+  df_XL <- join(df_gathered, df_XL, by="BOG_ID", type="full")
+  df_XL <- dplyr::arrange(df_XL, BOG_ID)
+   
+  head(df_XL)
+
+```
+
+And clean up some memory space
+
+```{r eval=FALSE}
+  
+  remove(df_gathered)
+
+```
+
+In this thesis we mostly managed the data manually in Access. When the AVM and the database structure gets more sophisticated this approach becomes more tricky. 
+
+<br>
+
+---
+
+# 4. PRELIMINARY DATA CLEANING
+
+<br>
+
+Each transaction needs to have a transaction date. If missing we use the publication date. If still missing we look at previous observation which are documented around the same time.
+
+```{r}
+
+  ## Obtain transaction date
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(transaction_date = 
+                         ifelse(!is.na(transfer_date) && !is.null(transfer_date), transfer_date,
+                         ifelse(!is.na(publication_date) && !is.null(publication_date), publication_date,
+                                NA)))
+        
+  ## if no date available fill with previous observation 
+  for(i in 1:nrow(df_XL)) {
+    if (is.na(df_XL$transaction_date[i])) {
+      df_XL$transaction_date[i] <- df_XL$transaction_date[i-1]
+    }
+  }
+
+print(paste0(sum(is.na(df_XL$transaction_date)), " missing observations in transaction date"))  
+
+```
+
+If year of construction is not filled in, replace missing with BAG data.
+
+```{r}
+
+  ## year of construction
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(year_of_construction = 
+                         ifelse(is.na(year_of_construction) && is.null(year_of_construction),
+                                BAG_construction_year,
+                                year_of_construction))
+
+print(paste0(sum(is.na(df_XL$year_of_construction)), " missing observations in year of construction"))  
+
+```                                                       
+
+If zero duration this means that it is likely that the nearest station was too far away. Thus make duration 60 min, distance 10000m and intecity FALSE. Check manually. 
+
+```{r}
+
+  df_XL <- df_XL %>% rowwise %>%
+           dplyr::mutate(train_station_duration = 
+                         ifelse(train_station_name %in% "ZERO_RESULTS", 99, train_station_duration))%>%
+           dplyr::mutate(train_station_distance = 
+                         ifelse(train_station_name %in% "ZERO_RESULTS", 9999, train_station_distance))%>%
+           dplyr::mutate(train_station_intercity = 
+                         ifelse(train_station_name %in% "ZERO_RESULTS", FALSE, train_station_intercity)) 
+
+print(paste0(sum(df_XL$train_station_name == "ZERO_RESULTS"), " missing observations in train station duration"))
+
+```
+
+Add centrality indicator (central, decentral).
+
+```{r eval=FALSE}
+
+  df_XL <- df_XL %>% rowwise %>%
+           dplyr::mutate(centrality = ifelse(train_station_duration <= 400 && 
+                                             train_station_intercity == TRUE, 
+                                             "central", "decentral"))
+
+```
+
+And City category (small, large) to data.
+
+```{r eval=FALSE}
+
+  ## city categories
+  city_cat <- c("Amsterdam", "Amsterdam-Zuidoost","Amsterdam_duivendrecht", "Schiphol-Rijk", 
+                "Hoofddorp", "Rotterdam", "Den Haag", "Utrecht", "Eindhoven")
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(city_category = ifelse(city %in% city_cat,"large", "small"))
+
+```
+
+<br>
+
+---
+
+# 5. WRITE TO DATABASE
+
+<br>
+
+We write the managed dataset back to the database.
+
+```{r eval=FALSE}  
+
+  ## Save to database
+  try(sqlDrop(db.conn, "tbl2_data_managed", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl2_data_managed", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+  
+```
+
+Close database
+
+```{r eval=FALSE}
+
+  odbcCloseAll()
+  remove(db.conn)
+  
+```
+
+---
+
+# 6. MAKE AVM SUBSET
+
+<br>
+
+Next, we create a seperate table for only the AVM relevant data. that is, (yet) unrelevant and metadata (data about the data) is filtered out of the dataset.
+
+```{r eval=FALSE}
+  
+  ## Include single property complete transactions only
+  df_XL <- dplyr::filter(df_XL, completeness %in% "COMPLETE")
+  df_XL <- dplyr::filter(df_XL, !portfolio %in% "PORTFOLIO")
+
+  ## Selection of variables
+  df_XL <- dplyr::select(.data=df_XL, 
+                                    
+        # TRANSACTION INFO
+          BOG_ID,
+          purchase_price_net,
+          price_per_sqm,
+          purchase_price_gross,
+          transfer_date,
+          portfolio,
+          owner_user,
+          purchaser,
+          vendor,
+          financing_bank,
+        # Geo
+          latitude,               
+          longitude,
+          NLD_region,
+          COROP_region,
+          provincie,
+          gemeente,
+          city,
+          wijk,
+          buurt,
+          address_complete,
+          CW_district_ID,
+          CW_district_name,
+          CW_district_type,
+          streetname,
+          housenumber,
+          postcode,
+        # BUILDING FACTORS
+          project_name,
+          building_type,
+          year_of_construction,
+          year_last_renovation,   
+          total_LFA,              
+          parking_spots,
+          building_height,
+          number_of_floors,
+          EP_huisnummer,
+          EP_energieklasse,     
+        # LOCATION FACTORS
+          city_category,         
+          centrality,                      
+          walkscore,
+          walkscore_link,
+          lbm_total_score,  
+          lbm_woningen,
+          lbm_bewoners,
+          lbm_voorzieningen,
+          lbm_veiligheid,
+          lbm_fysieke_omgeving,
+        # OV
+          train_station_name,
+          train_station_lng,
+          train_station_lat,
+          train_station_intercity,
+          train_station_distance,
+          train_station_duration,
+          highway_access_name,
+          highway_access_lng,
+          highway_access_lat,
+          highway_access_distance,
+          highway_access_duration,
+          bus_station_name,
+          bus_station_lng,
+          bus_station_lat,
+          bus_station_distance,
+          bus_station_duration,
+          subway_station_name,
+          subway_station_lng,
+          subway_station_lat,
+          subway_station_distance,
+          subway_station_duration,
+          airport_name,
+          airport_lng,
+          airport_lat,
+          airport_distance,
+          airport_duration,
+        # LEASE FACTORS
+          key_tenants,
+          let_LFA,
+          vacant_LFA,
+          vacancy_perc,         
+          RI_total,               
+          ERV_total,             
+          TRI_total,              
+          ERV_vacancy,
+          ERV_per_parking, 
+          RI_per_sqm,
+          TRI_per_sqm,
+          ERV_per_sqm,
+          ERV_per_sqm_vacancy,
+          WALE_excl_vacancy,          
+          WALE_incl_vacancy,          
+          rental_difference_PV,
+          groundlease,
+          groundlease_current,
+          groundlease_buy_off,
+        # KPI's
+          GIY_RI_GMV,
+          GIY_ERV_GMV,
+          GIY_TRI_GMV,
+          multiple_NMV_RI,
+          multiple_NMV_ERV,
+          multiple_NMV_TRI,
+          UK_NIY_NOI_GMV,
+          NOI_CAP_NMV_NOI,
+          residual_value_per_sqm,
+        # logbook
+          date_new_entry,
+          date_last_adjustment,
+          confidential,
+          completeness,
+          reliability,
+          comment_reliability
+          )
+  
+```
+
+We finish the *Manage* Phase by saving the subset ready for the data munging steps to database and close the connection.
+
+```{r eval=FALSE}  
+
+  ## Save to database
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+  try(sqlDrop(db.conn, "tbl2_data_managed_AVM", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl2_data_managed_AVM", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+  
+```
+
+Close Connections and Clean Workspace
+
+```{r}  
+
+  odbcCloseAll()
+  remove(db.conn)
+  rm(list = ls())
+  
+```
+
+---
+
+<br>
+
+> Go back to [top](#top)

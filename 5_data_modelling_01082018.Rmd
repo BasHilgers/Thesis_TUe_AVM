@@ -1,0 +1,2474 @@
+---
+title: "PHASE 5: DATA MODELING"
+subtitle: "Thesis TUe - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+<br>
+
+---
+
+# 1. INTRODUCTION
+
+<br>
+
+In this phase we cover the *price modeling process*. We compare the performance of various models (both the more traditional regession and newer machine learning techniques) in order to find the best model for the data at hand. In order to provide a reliable comparison we ensure that the observations (trian/test) and variables are consistent in the different models. Conclusions are always evaluated **out-of-sample**!
+
+As always, we start with a set of preliminary commands.
+
+```{r set-options, warning=FALSE, message=FALSE}  
+
+  ## Load Libraries
+  library(knitr)        # publication options markdown
+  library(tidyverse)    # toolkit data
+  library(RODBC)        # connect to Access
+  library(randomForest) # random forest
+  library(caret)        # ML hyperparameter tuning
+  library(xgboost)      # XGBoost
+  library(ranger)       # random forest 2
+  library(Metrics)      # MAPE MPE
+  library(MASS)         # stepwise regression
+  library(BMA)          # Bayesian Model Averaging
+  library(car)          # vif (multicollinearity)
+  library(lmtest)       # heteroskedasticity
+  library(plm)          # White's regression (heteroskedasticity robust)
+  library(spdep)        # spatial regression
+  library(spgwr)        # GWR
+
+  ## Set data and code directory
+  wd.dir   <- file.path('C:/Users/bashi/Desktop/TUe Thesis')
+  data.dir <- file.path(wd.dir, '5 Data', 'AVM database')
+  code.dir <- file.path(wd.dir, '6 Modelling', 'modules')
+  opts_knit$set(root.dir = wd.dir)
+  
+  ## Load custom source files
+  # source(paste0(code.dir, '/custom_functions_data_modeling.R'))
+    source(paste0(code.dir, '/custom_functions_data_preparation.R'))
+  
+  ## file options
+  options(width=120) # control width output
+  knitr::opts_chunk$set(out.width='800px', dpi=200) # control width figures
+  knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+  options(stringsAsFactors = TRUE)
+  options(scipen=999)
+  options(digits = 4)
+  
+  ## for reproducible probabilities
+  set.seed(123) 
+
+```
+
+And load in the data from our database.
+
+```{r}  
+
+  ## Establish connection
+  db.conn <- odbcConnectAccess2007(file.path(data.dir,'AVM_database.accdb'))
+  df_XL <- sqlFetch(db.conn, "tbl4_data_cleaned")
+  odbcCloseAll()
+  remove(db.conn)
+  
+  ## No missing values should be present. Final check.
+  df_XL <- df_XL[complete.cases(df_XL), ]
+  
+  ## show variables
+  str(df_XL)
+  
+```
+
+<br>
+
+## 1.1 - Preliminary Data Preperation
+
+Some necessary data transformations.
+
+```{r}  
+
+  ## convert variables to correct format
+  df_XL <- dplyr::mutate(df_XL, transfer_date = as.Date(transfer_date, format="%Y-%m-%d"))
+  df_XL <- dplyr::mutate(df_XL, disc_fields = as.character(disc_fields))
+  df_XL <- dplyr::mutate(df_XL, disc_type = as.character(disc_type))
+  
+  ## Numeric into Dummies
+  df_XL <- dplyr::mutate(df_XL, year_transaction = as.factor(year_transaction))
+  df_XL <- dplyr::mutate(df_XL, halfyear_transaction = as.factor(halfyear_transaction))
+  
+  ## ordered factors
+  # df_XL$EP_energieklasse <- ordered(df_XL$EP_energieklasse, 
+  #                                    levels = c("below_D","D","C","B","A","Above_A"))
+  # df_XL$building_period_renov <- ordered(df_XL$building_period_renov, 
+  #                               levels = c("before_1906","1906-1944","1945-1970",
+  #                                          "1971-1980","1981-1990","1991-2000",
+  #                                         "2001-2010","after_2010"))
+  
+  ## levels (order) -> First in list excluded in reg results (dummy variable trap)
+  df_XL$EP_energieklasse <- factor(df_XL$EP_energieklasse, levels = c("A","below_C", "C","B","Above_A"))  
+  df_XL$building_period_renov <- factor(df_XL$building_period_renov, 
+                                        levels = c("after_2010","before_1906","1906-1944","1945-1970",
+                                                   "1971-1990","1991-2000",
+                                                   "2001-2010"))
+  df_XL$building_period <- factor(df_XL$building_period, 
+                                      levels = c("after_2010","before_1906","1906-1944","1945-1970",
+                                                 "1971-1990","1991-2000",
+                                                 "2001-2010"))
+  df_XL$year_transaction <- factor(df_XL$year_transaction, 
+                                   levels = c("2017","2010","2011","2012","2013",
+                                              "2014","2015","2016","2018"))
+  df_XL$city_category <- factor(df_XL$city_category, levels = c("small","large"))
+  df_XL$centrality <- factor(df_XL$centrality, levels = c("decentral","central")) 
+  df_XL$CW_district_type <- factor(df_XL$CW_district_type, levels = c("KA","BE","GE","OTHER"))
+  df_XL$underrented <- factor(df_XL$underrented, levels = c("MARKET","OVER","UNDER"))
+
+```
+
+Check levels. *Note* that the first level is left out of the regression results (dummy variable trap)
+
+```{r}  
+
+  ## field types (before ordered)
+  field.types <- unlist(lapply(df_XL, class))
+  
+  ## view levels
+  sapply(df_XL[, field.types == 'factor'], levels)
+  
+```
+
+<br>
+
+#### Outliers Sensitivity Analysis
+
+Different scenarios of outliers are tested from this point on. That is: change values in chunk below, run the rest of the code and compare results.
+
+```{r}  
+
+  ## New outlier space Residuals
+  df_XL$discordant_lm1 <- 0
+  df_XL$discordant_lm2 <- 0
+  df_XL$discordant_lm3 <- 0
+
+  ## remove all outlier with type
+  #df_XL <- dplyr::filter(df_XL, discordant_uv1 != 1)
+  df_XL <- dplyr::filter(df_XL, discordant_mv2 != 1)
+  df_XL <- dplyr::filter(df_XL, discordant_mv1 != 1)
+  df_XL <- dplyr::filter(df_XL, discordant_lm1 != 1)
+  df_XL <- dplyr::filter(df_XL, discordant_lm2 != 1)
+  df_XL <- dplyr::filter(df_XL, discordant_lm3 != 1)
+  
+  ## remove formally tested outliers from residuals (see below par2.5 - cookSD>3xmean)
+  outiers_BOG_ID <- c(136,160,227,239,250,256,310,354,402,474,476,500,586,660,804,805,
+                      816,846,885,1006,1035,1098,1181,1227,1274,1357,397,1048,1311,1324,
+                      137,173,331,341,360,475,502,603,711,937,958,1033,1041,1136,1138,
+                      401,919,203,401,763,919,1030,1238,1476,1141,1143,1174,1269,1330,1345)
+  df_XL <- df_XL[!df_XL$BOG_ID %in% outiers_BOG_ID,]
+
+  ## info
+  print(paste0("Number of Observations Left: ",nrow(df_XL)))
+
+```
+
+<br>
+
+## 1.2 - Quantifying Performence Setup
+
+Split train/test set. Here we  also use our repeated cross validation to lower variability of results due to subset bias.
+
+```{r}  
+
+  ## train / test split for cross validation
+  split <- sample(1:2, size = nrow(df_XL), prob = c(0.8, 0.2), replace = TRUE)
+
+  df_train <- df_XL[split == 1, ]
+  df_test <- df_XL[split == 2, ]
+
+  ## To do: LOOCV on new data
+  #df_new <- dplyr::filter(df_XL, year_transaction == 2018)
+
+```
+
+Set up dataframe to store predictions of the models.
+
+```{r}  
+  
+  ## Out-of-Sample
+  df_pred_in <- data.frame(BOG_ID = df_train$BOG_ID,
+                           actual = df_train$purchase_price)
+
+  ## In-Sample
+  df_pred_out <- data.frame(BOG_ID = df_test$BOG_ID,
+                            actual = df_test$purchase_price)
+
+  ## LOOCV
+  df_pred_LOOCV <- data.frame(BOG_ID = df_XL$BOG_ID,
+                              actual = df_XL$purchase_price)
+  
+  ## LOOCV 2018 (new recent data)
+  df_pred_2018 <- df_XL %>% dplyr::filter(year_transaction == 2018)
+  df_pred_2018 <- data.frame(BOG_ID = df_pred_2018$BOG_ID,
+                             actual = df_pred_2018$purchase_price)
+
+  ## overall prediction accuracy
+  df_pred_acc <- data.frame(R2 = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            rmse_out = c(NA, NA, NA, NA, NA, NA, NA, NA,NA, NA, NA, NA, NA),
+                            rmse_in = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            rmse_LOOCV = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            rmse_2018 = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            mape_out = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            mape_in = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            mape_LOOCV = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            mape_2018 = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA),
+                            COD = c(NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA, NA))
+
+```
+
+<br>
+
+#### A. Out-of-Sample Results
+
+```{r}  
+
+  out_of_sample_results <- function(out.row, out.name, model.res){
+    
+    ## predict values
+    model.pred <- predict(model.res, df_test)
+    
+    ## prediction results
+    df_pred_out[eval(out.name)] <- exp(model.pred)
+    # df_pred_out[eval(paste0("d.",eval(out.name)))] <- 
+    #             df_pred_out$actual - df_pred_out[eval(out.name)]
+    # df_pred_out[eval(paste0("d.",eval(out.name),'.perc'))] <- 
+    #             df_pred_out[eval(paste0("d.",eval(out.name)))] / df_pred_out$actual * 100
+
+    ## overall model accuracy
+    i = out.row
+    rownames(df_pred_acc)[i] <- out.name
+    df_pred_acc$R2[i] <- try(summary(model.res)[["adj.r.squared"]])
+    df_pred_acc$rmse_out[i] <- Metrics::rmse(df_pred_out$actual, df_pred_out[[eval(out.name)]])
+    df_pred_acc$mape_out[i] <- Metrics::mape(df_pred_out$actual, df_pred_out[[eval(out.name)]]) * 100
+
+    ## return results
+    my_list <- list("df_pred_out" = df_pred_out, "df_pred_acc" = df_pred_acc)
+    return(my_list)
+  }
+
+```
+
+#### B. In-Sample Results
+  
+```{r}  
+  
+  in_sample_results <- function(out.row, out.name, model.res){
+    
+    ## predict values
+    model.pred <- predict(model.res, df_train)
+    
+    ## prediction results
+    df_pred_in[eval(out.name)] <- exp(model.pred)
+    # df_pred_in[eval(paste0("d.",eval(out.name)))] <- 
+    #            df_pred_in$actual - df_pred_in[eval(out.name)]
+    # df_pred_in[eval(paste0("d.",eval(out.name),'.perc'))] <- 
+    #            df_pred_in[eval(paste0("d.",eval(out.name)))] / df_pred_in$actual * 100
+    
+    ## overall model accuracy
+    i = out.row
+    rownames(df_pred_acc)[i] <- out.name
+    df_pred_acc$rmse_in[i] <- Metrics::rmse(df_pred_in$actual, df_pred_in[[eval(out.name)]])
+    df_pred_acc$mape_in[i] <- Metrics::mape(df_pred_in$actual, df_pred_in[[eval(out.name)]]) * 100
+
+    ## return results
+    my_list <- list("df_pred_in" = df_pred_in, "df_pred_acc" = df_pred_acc)
+    return(my_list)
+  }
+  
+```
+
+#### C. Leave One Out Cross Validation (LOOCV)
+
+```{r}  
+  
+  LOOCV_results <- function(out.row, out.name, reg.formula){
+    
+    for (k in 1:nrow(df_XL)) {
+    
+      ## set data
+      loocv_train <- df_XL[-k, ] # every observation except k
+      loocv_test  <- df_XL[k, ]   # test set with only observation k
+      
+      ## run regression and predict result
+      model.res  <- lm(data = loocv_train, reg.formula)
+      model.pred <- predict(model.res, loocv_test)
+      
+      ## prediction results
+      df_pred_LOOCV[[eval(out.name)]][k] <- exp(model.pred)
+      # df_pred_LOOCV[[eval(paste0("d.",eval(out.name)))]][k] <- 
+      #               df_pred_LOOCV$actual[k] - df_pred_LOOCV[[eval(out.name)]][k]
+      # df_pred_LOOCV[[eval(paste0("d.",eval(out.name),'.perc'))]][k] <- 
+      #               df_pred_LOOCV[[eval(paste0("d.",eval(out.name)))]][k] / df_pred_LOOCV$actual[k] * 100
+      
+    } # repeat k-times
+    
+    ## overall model accuracy
+    i = out.row
+    rownames(df_pred_acc)[i] <- out.name
+    df_pred_acc$rmse_LOOCV[i] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV[[eval(out.name)]])
+    df_pred_acc$mape_LOOCV[i] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV[[eval(out.name)]]) * 100
+
+    ## return results
+    my_list <- list("df_pred_LOOCV" = df_pred_LOOCV, "df_pred_acc" = df_pred_acc)
+    return(my_list)
+  }
+
+```
+
+#### D. Simulation 2018 LOOCV
+
+```{r}  
+  
+  sim2018_results <- function(out.row, out.name, reg.formula){
+    
+    ## set data
+    sim2018_train <- df_XL %>% dplyr::filter(year_transaction != 2018) # exclude 2018 from train 
+    sim2018_test <- df_XL %>% dplyr::filter(year_transaction == 2018)  # test set with only 2018
+    
+    ## adjust data where we assume that 2018 = 2017 dummy
+    sim2018_test <- sim2018_test %>% rowwise %>% dplyr::mutate(year_transaction = 2017)
+    sim2018_test$year_transaction <- as.factor(sim2018_test$year_transaction) 
+      
+    ## loop from begin 2018 to last observation
+    for (k in 1:nrow(sim2018_test)) {
+      object <- sim2018_test[k, ]
+      
+      ## run regression and predict results
+      model.res  <- lm(data = sim2018_train, reg.formula)
+      model.pred <- predict(model.res, object)
+      
+      ## prediction results
+      df_pred_2018[[eval(out.name)]][k] <- exp(model.pred)
+      # df_pred_2018[[eval(paste0("d.",eval(out.name)))]][k] <- 
+      #               df_pred_2018$actual[k] - df_pred_2018[[eval(out.name)]][k]
+      # df_pred_2018[[eval(paste0("d.",eval(out.name),'.perc'))]][k] <- 
+      #               df_pred_2018[[eval(paste0("d.",eval(out.name)))]][k] / df_pred_2018$actual[k] * 100
+      
+      ## add object to the training set
+      sim2018_train <- rbind(sim2018_train, object)
+  
+    } # repeat k-times
+    
+    ## overall model accuracy
+    i = out.row
+    rownames(df_pred_acc)[i] <- out.name
+    df_pred_acc$rmse_2018[i] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018[[eval(out.name)]])
+    df_pred_acc$mape_2018[i] <- Metrics::mape(df_pred_2018$actual, df_pred_2018[[eval(out.name)]]) * 100
+
+    ## return results
+    my_list <- list("df_pred_2018" = df_pred_2018, "df_pred_acc" = df_pred_acc)
+    return(my_list)
+  }
+  
+```
+
+#### E. Coefficient of Dispersion (COD)
+  
+```{r}  
+  
+  COD <- function(out.row, out.name, df){
+
+    df <- data.frame(df)[1]
+    median_R <- median(df[,1])
+    sum.result <- NA
+    
+    for (i in 1:nrow(df)){
+      sum.result <- sum((abs(df[i,] - median_R ) / median_R),sum.result,na.rm=TRUE)
+    }
+
+    i = out.row
+    rownames(df_pred_acc)[i] <- out.name
+    df_pred_acc$COD[i] <- 1/nrow(df)*sum.result #already percent
+    
+    return(df_pred_acc)
+  }
+
+```
+
+<br>
+
+---
+
+# 2. HEDONIC REGRESSION
+
+<br>
+
+First, we run a baseline hedonic model that is used as baseline to evaluate other models against. Next, we use stepped regression that include significant variables only.
+
+<br>
+
+## 2.1 - Model Specification
+
+#### Model Specification 1
+
+LFA only
+
+```{r}
+
+  ## Formula
+  reg.formula <- as.formula("log(purchase_price) ~ log(total_LFA) +  
+                             CW_district_type + city_category + centrality + year_transaction")
+
+  ## OLS
+  ols <- lm(data=df_XL, reg.formula)
+  summary(ols)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(ols, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(ols)^2
+  gls <- lm(data=df_XL, reg.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r }
+
+  ## Prediction Accuracy
+  out.row <- 1
+  out.name <- 'LFA_only'
+  
+  df_pred_out <- out_of_sample_results(out.row,'lm.base',ols)$df_pred_out
+  df_pred_in <- in_sample_results(out.row,'lm.base',ols)$df_pred_in
+  df_pred_LOOCV <- LOOCV_results(out.row,'lm.base',reg.formula)$df_pred_LOOCV
+  df_pred_2018 <- sim2018_results(out.row,'lm.base',reg.formula)$df_pred_2018
+  
+  df_pred_acc <- out_of_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- in_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- LOOCV_results(out.row,out.name,reg.formula)$df_pred_acc
+  df_pred_acc <- sim2018_results(out.row,out.name,reg.formula)$df_pred_acc
+  
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Model Specification 2
+
+LFA + Building Factors
+
+```{r echo=FALSE}
+
+  ## Formula
+  reg.formula <- as.formula("log(purchase_price) ~ log(total_LFA) + log(building_height) + 
+                             parking_spots + EP_energieklasse + building_period + 
+                             year_transaction")
+  reg.formula
+  
+  ## OLS
+  ols <- lm(data=df_XL, reg.formula)
+  summary(ols)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(ols, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(ols)^2
+  gls <- lm(data=df_XL, reg.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r echo=FALSE}
+
+  ## Prediction Accuracy
+  out.row <- 2
+  out.name <- 'Building'
+  
+  df_pred_out <- out_of_sample_results(out.row,'lm.base',ols)$df_pred_out
+  df_pred_in <- in_sample_results(out.row,'lm.base',ols)$df_pred_in
+  df_pred_LOOCV <- LOOCV_results(out.row,'lm.base',reg.formula)$df_pred_LOOCV
+  df_pred_2018 <- sim2018_results(out.row,'lm.base',reg.formula)$df_pred_2018
+  
+  df_pred_acc <- out_of_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- in_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- LOOCV_results(out.row,out.name,reg.formula)$df_pred_acc
+  df_pred_acc <- sim2018_results(out.row,out.name,reg.formula)$df_pred_acc
+
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Model Specification 3
+
+Including Location
+
+```{r echo=FALSE}
+
+  ## Formula
+  reg.formula <- as.formula("log(purchase_price) ~ log(total_LFA) + log(building_height) + 
+                             parking_spots + EP_energieklasse + building_period + 
+                             walkscore + lbm_total_score + log(train_station_duration) + log(highway_access_duration) + 
+                             year_transaction")
+  reg.formula
+
+  ## OLS
+  ols <- lm(data=df_XL, reg.formula)
+  summary(ols)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(ols, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(ols)^2
+  gls <- lm(data=df_XL, reg.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r echo=FALSE}
+
+  ## Prediction Accuracy
+  out.row <- 3
+  out.name <- 'Building+Location'
+  
+  df_pred_out <- out_of_sample_results(out.row,'lm.base',ols)$df_pred_out
+  df_pred_in <- in_sample_results(out.row,'lm.base',ols)$df_pred_in
+  df_pred_LOOCV <- LOOCV_results(out.row,'lm.base',reg.formula)$df_pred_LOOCV
+  df_pred_2018 <- sim2018_results(out.row,'lm.base',reg.formula)$df_pred_2018
+  
+  df_pred_acc <- out_of_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- in_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- LOOCV_results(out.row,out.name,reg.formula)$df_pred_acc
+  df_pred_acc <- sim2018_results(out.row,out.name,reg.formula)$df_pred_acc
+ 
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Model Specification 4
+
+Including Location and GIS
+
+```{r echo=FALSE}
+
+  ## Formula
+  reg.formula <- as.formula("log(purchase_price) ~ log(total_LFA) + log(building_height) + 
+                             parking_spots + EP_energieklasse + building_period + 
+                             walkscore + lbm_total_score + log(train_station_duration) + log(highway_access_duration) + 
+                             CW_district_type + city_category + centrality + year_transaction")
+  reg.formula
+
+  ## OLS
+  ols <- lm(data=df_XL, reg.formula)
+  summary(ols)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(ols, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(ols)^2
+  gls <- lm(data=df_XL, reg.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r echo=FALSE}
+
+  ## Prediction Accuracy
+  out.row <- 4
+  out.name <- 'Building+Location+Control'
+  
+  df_pred_out <- out_of_sample_results(out.row,'lm.base',ols)$df_pred_out
+  df_pred_in <- in_sample_results(out.row,'lm.base',ols)$df_pred_in
+  df_pred_LOOCV <- LOOCV_results(out.row,'lm.base',reg.formula)$df_pred_LOOCV
+  df_pred_2018 <- sim2018_results(out.row,'lm.base',reg.formula)$df_pred_2018
+  
+  df_pred_acc <- out_of_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- in_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- LOOCV_results(out.row,out.name,reg.formula)$df_pred_acc
+  df_pred_acc <- sim2018_results(out.row,out.name,reg.formula)$df_pred_acc
+  
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Model Specification 5
+
+Lease Factors Only
+
+```{r echo=FALSE}
+
+  ## Formula
+  reg.formula <- as.formula("log(purchase_price) ~ log(total_LFA) + 
+                             log(TRI_per_sqm) + vacancy + log(WALE) + underrented +
+                             CW_district_type + city_category + centrality + year_transaction")
+  reg.formula
+  
+  ## OLS
+  ols <- lm(data=df_XL, reg.formula)
+  summary(ols)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(ols, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(ols)^2
+  gls <- lm(data=df_XL, reg.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r echo=FALSE}
+
+  ## Prediction Accuracy
+  out.row <- 5
+  out.name <- 'Lease_only'
+  
+  df_pred_out <- out_of_sample_results(out.row,'lm.base',ols)$df_pred_out
+  df_pred_in <- in_sample_results(out.row,'lm.base',ols)$df_pred_in
+  df_pred_LOOCV <- LOOCV_results(out.row,'lm.base',reg.formula)$df_pred_LOOCV
+  df_pred_2018 <- sim2018_results(out.row,'lm.base',reg.formula)$df_pred_2018
+  
+  df_pred_acc <- out_of_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- in_sample_results(out.row,out.name,ols)$df_pred_acc
+  df_pred_acc <- LOOCV_results(out.row,out.name,reg.formula)$df_pred_acc
+  df_pred_acc <- sim2018_results(out.row,out.name,reg.formula)$df_pred_acc
+  
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Model Specification 6
+
+All theoretically plausible variables (=baseline model before stepwise regression)
+
+```{r echo=FALSE}
+
+  ## Formula
+  lm.base.formula <- as.formula("log(purchase_price) ~ log(total_LFA) + log(building_height) + 
+                                 parking_spots + EP_energieklasse + building_period +
+                                 walkscore + lbm_total_score + log(train_station_duration) + log(highway_access_duration) +
+                                 log(TRI_per_sqm) + vacancy + log(WALE) + underrented +
+                                 CW_district_type + city_category + centrality + year_transaction")
+  lm.base.formula
+  
+  ## OLS
+  lm.base <- lm(data=df_XL, lm.base.formula)
+  summary(lm.base)
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(lm.base, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(lm.base)^2
+  gls <- lm(data=df_XL, lm.base.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+```{r}
+
+  ## output IDs
+  out.row <- 6
+  out.name <- 'lm.base'
+
+  ## out-of-sample
+  df_pred_out <- out_of_sample_results(out.row,out.name,lm.base)$df_pred_out
+  df_pred_acc <- out_of_sample_results(out.row,out.name,lm.base)$df_pred_acc
+  df_pred_out$d.lm.base <- df_pred_out$actual - df_pred_out$lm.base
+  df_pred_out$d.lm.base.perc <- df_pred_out$d.lm.base / df_pred_out$actual * 100
+
+  ## in-sample
+  df_pred_in <- in_sample_results(out.row,out.name,lm.base)$df_pred_in
+  df_pred_acc <- in_sample_results(out.row,out.name,lm.base)$df_pred_acc
+  
+  ## LOOCV
+  df_pred_LOOCV <- LOOCV_results(out.row,out.name,lm.base.formula)$df_pred_LOOCV
+  df_pred_acc <- LOOCV_results(out.row,out.name,lm.base.formula)$df_pred_acc
+  df_pred_LOOCV$d.lm.base <- df_pred_LOOCV$actual - df_pred_LOOCV$lm.base
+  df_pred_LOOCV$d.lm.base.perc <- df_pred_LOOCV$d.lm.base / df_pred_LOOCV$actual * 100
+  
+  ## LOOCV 2018
+  df_pred_2018 <- sim2018_results(out.row,out.name,lm.base.formula)$df_pred_2018
+  df_pred_acc <- sim2018_results(out.row,out.name,lm.base.formula)$df_pred_acc
+  df_pred_2018$d.lm.base <- df_pred_2018$actual - df_pred_2018$lm.base
+  df_pred_2018$d.lm.base.perc <- df_pred_2018$d.lm.base / df_pred_2018$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.lm.base.perc)
+  
+  ## Show results
+  df_pred_acc[1:out.row,]
+  
+```
+
+<br>
+
+#### Graph - Prediction Accuracy Distribution [Baseline Model]
+
+```{r warning=FALSE}
+
+  ## view output
+  ggplot(data=df_pred_LOOCV, aes(x=d.lm.base.perc)) + theme_bw() +
+    geom_density(fill='#A4A4A4', alpha = 0.5) +
+    geom_density(data=df_pred_2018, aes(x=d.lm.base.perc), size=1, linetype='dotdash') +
+    geom_vline(aes(xintercept=mean(d.lm.base.perc)), colour="darkred", linetype="dashed", size=1) +
+    labs(title="Baseline Regression", x ="", y = "") + xlim(c(-100,100))
+
+```
+<br>
+
+## 2.2 - Stepwise regression 
+
+Next, we move to the stepwise regression. This method is used to construct the final baseline model.
+
+```{r r echo = TRUE, results = 'hide'}
+
+  ## Stepwise regression
+  lm.step <- stepAIC(lm.base, direction="both")
+  lm.step.formula <- formula(lm.step)
+  
+```
+
+```{r}
+
+  ## Show results Stepwise regression
+  summary(lm.step)
+
+  ## OLS
+  print(paste0("MAPE OLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(lm.step, df_XL)))))
+
+  ## GLS
+  w <- 1/resid(lm.step)^2
+  gls <- lm(data=df_XL, lm.step.formula, weights = w)
+  print(paste0("MAPE GLS: ",Metrics::mape(df_XL$purchase_price, exp(predict(gls, df_XL)))))
+
+```
+
+#### Model Performance [Stepped Regression]
+
+```{r include = FALSE}
+  
+  ## output IDs
+  out.row <- 7
+  out.name <- 'lm.step'
+
+  ## out-of-sample
+  df_pred_out <- out_of_sample_results(out.row,out.name,lm.step)$df_pred_out
+  df_pred_acc <- out_of_sample_results(out.row,out.name,lm.step)$df_pred_acc
+  df_pred_out$d.lm.step <- df_pred_out$actual - df_pred_out$lm.step
+  df_pred_out$d.lm.step.perc <- df_pred_out$d.lm.step / df_pred_out$actual * 100
+
+  ## in-sample
+  df_pred_in <- in_sample_results(out.row,out.name,lm.step)$df_pred_in
+  df_pred_acc <- in_sample_results(out.row,out.name,lm.step)$df_pred_acc
+  
+  ## LOOCV
+  df_pred_LOOCV <- LOOCV_results(out.row,out.name,lm.step.formula)$df_pred_LOOCV
+  df_pred_acc <- LOOCV_results(out.row,out.name,lm.step.formula)$df_pred_acc
+  df_pred_LOOCV$d.lm.step <- df_pred_LOOCV$actual - df_pred_LOOCV$lm.step
+  df_pred_LOOCV$d.lm.step.perc <- df_pred_LOOCV$d.lm.step / df_pred_LOOCV$actual * 100
+  
+  ## LOOCV 2018
+  df_pred_2018 <- sim2018_results(out.row,out.name,lm.step.formula)$df_pred_2018
+  df_pred_acc <- sim2018_results(out.row,out.name,lm.step.formula)$df_pred_acc
+  df_pred_2018$d.lm.step <- df_pred_2018$actual - df_pred_2018$lm.step
+  df_pred_2018$d.lm.step.perc <- df_pred_2018$d.lm.step / df_pred_2018$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.lm.step.perc)
+  
+  ## Show results
+  df_pred_acc[1:out.row,]
+  
+```
+  
+#### Graph - Prediction Accuracy Distribution [Stepwise Model]
+
+```{r include=FALSE}
+
+    df_pred_out$d.lm.step <- df_pred_out$actual - df_pred_out$lm.step
+    df_pred_out$d.lm.step.perc <- df_pred_out$d.lm.step / df_pred_out$actual * 100
+
+    df_pred_2018$d.lm.step <- df_pred_2018$actual - df_pred_2018$lm.step
+    df_pred_2018$d.lm.step.perc <- df_pred_2018$d.lm.step / df_pred_2018$actual * 100
+    
+    df_pred_LOOCV$d.lm.step <- df_pred_LOOCV$actual - df_pred_LOOCV$lm.step
+    df_pred_LOOCV$d.lm.step.perc <- df_pred_LOOCV$d.lm.step / df_pred_LOOCV$actual * 100
+    
+```
+
+```{r message=FALSE, warning=FALSE}
+
+ ## view output
+  ggplot(data=df_pred_LOOCV, aes(x=d.lm.step.perc)) + theme_bw() +
+    geom_density(fill='#A4A4A4', alpha = 0.5) +
+    geom_density(data=df_pred_2018, aes(x=d.lm.step.perc), size=1, linetype='dotdash') +
+    geom_vline(aes(xintercept=mean(d.lm.step.perc)), colour="darkred", linetype="dashed", size=1) +
+    labs(title="Stepwise Regression", x ="", y = "") + xlim(c(-100,100))
+  
+```
+
+#### (X) Bayesian Model Averaging (BMA)
+
+```{r eval=FALSE}
+
+  ## Bayesian Model Averaging (BMA) - Future Research
+  lm.bma <- bicreg(y = log(df_XL$purchase_price),
+                   x = df_XL[,c('total_LFA','building_period','EP_energieklasse')])
+              
+  summary(lm.bma)
+
+```
+
+<br>
+
+## 2.3 - Diagnostics
+
+We now run some diagnostics on the model.
+
+We start by testing for **multicollinearity**. We check the variance inflation factors (VIF) and find that none of them exceed 10, the standard warning level.
+
+```{r}
+              
+  vif(lm.step)
+  sqrt(vif(lm.step)) > 2
+
+```
+
+Next, we test for **heteroskedasticity** with two breusch-Pagan test, one studentized, one not. Both indicate high levels of heteroskedasticity.
+
+```{r}
+              
+  ## studentized
+  bptest(lm.step)
+
+  ## not studentized
+  ncvTest(lm.step)
+
+```
+
+Given this presence of heteroskeasticity, we apply **White's correction** to the standard errors to see if any of the previously significant variables undergo large changes in this significance levels.
+
+```{r}
+              
+  coeftest(lm.step, vcov=vcovHC(lm.step, "HC1"))
+
+```
+
+We test for **Spatial Autocorrelation** in the residuals of our model.
+
+We begin with converting the transaction data to a *Spatial Point Data Frame*.
+
+```{r}
+              
+  df_XL.sp <- SpatialPointsDataFrame(coords=cbind(df_XL$longitude,
+                                                  df_XL$latitude),
+                                      data=df_XL)
+
+```
+
+We then build a spatial weights matrix of the observations, using an *inverse distance-weighted*, 10-nearest neighbors matrix.
+
+```{r message=FALSE, warning=FALSE}
+              
+  ## Create neigbor list (use 10 nearest)
+  nbList <- knn2nb(knearneigh(df_XL.sp, 10))
+
+  ## create distances
+  nbDists <- nbdists(nbList, df_XL.sp)
+
+  ## Create a inverse distance weighting function (.0025 is the nugget)
+  dwf <- function(x) {1 / ((x + 0.0025) ^2)}
+
+  ## Build the SWM
+  swm <- listw2U(nb2listw(nbList, 
+                          glist= lapply(nbDists, dwf), 
+                          style="W",
+                          zero.policy = TRUE))
+  
+```
+
+Using the spatial weights matrix, we then apply a Moran's I test. We find significant **Spatial Autocorrelation**.
+
+```{r}
+
+  ## moran's I test
+  mi.test <- moran.test(lm.step$resid, swm, zero.policy = TRUE)
+  
+  ## see output
+  mi.test
+
+```
+
+Next, we use a Lagrange Multiplier test to determine if the **Spatial Dependence** is in the dependent variable (spatial lag SAR) or in the model errors (spatial error SER)
+
+```{r}
+   
+  ## Lagrange Multiplier test
+  lm.test <- lm.LMtests(lm.step,
+                        swm,
+                        test=c("LMerr", "LMlag","RLMerr","RLMlag"))
+
+  ## see output
+  lm.test
+
+```
+
+## 2.4 - (X) Spatial Models
+
+Finding spatial autocorrelation in the error terms of our model, we now specify a spatial error model. We use the same spatial weights matrix specified above. 
+
+```{r eval=FALSE}  
+
+   mod.se <- errorsarlm(as.formula(lm.step),
+                        data=df_XL.sp,
+                        swm, 
+                        #method="spam", 
+                        zero.policy=TRUE)
+
+```
+
+We then test for spatial autocorrelation in the error terms of the spatial model. 
+
+```{r eval=FALSE}  
+
+   mi.test.se <- moran.test(mod.se$resid, swm, zero.policy=TRUE)
+
+```
+
+Spatial heterogeneity may also be found in a model covering a large geographic area the size of Seattle.  We test for spatial heterogeneity in our model (and data) through the use of a geographically weighted regression (GWR). 
+
+First we will calibrate the bandwidth of the kernel that will be used to capture the points for each regression (this may take a little while) and then run the model:
+
+```{r eval=FALSE}  
+   
+  #calculate kernel bandwidth
+  GWRbandwidth <- gwr.sel(lm.step, df_XL.sp, adapt=T) 
+
+```    
+
+We do so by first specificying the geographically weighted model (bandwidth=.1)
+
+
+We then examine the results of the GWR and find some spatial heterogeneity.
+
+```{r eval=FALSE}  
+
+  ## estimate GWR
+  mod.gwr <- gwr(lm.step, df_XL.sp, adapt=GWRbandwidth, hatmatrix=TRUE, se.fit=TRUE) 
+
+  ## show model
+  mod.gwr
+
+```
+
+<br>
+
+## 2.5 - Residual Analysis
+
+We investigate the residual plots of the fitted versus estimated values. 
+Note: we use the final specification of the stepped regression.
+
+```{r eval=FALSE}
+  
+    model <- lm.step
+
+    ## Residuals
+    ggplot(model, aes(.fitted, .resid)) + geom_point() +
+        stat_smooth(method="loess")+geom_hline(yintercept=0, col="red", linetype="dashed") +
+        xlab("Fitted values")+ylab("Residuals") + theme_bw()
+
+    ## Standardized Residuals
+    ggplot(model, aes(qqnorm(.stdresid)[[1]], .stdresid))+geom_point(na.rm = TRUE) +
+      geom_abline()+xlab("Theoretical Quantiles")+ylab("Standardized Residuals") +
+      ggtitle("Normal Q-Q")+theme_bw()
+
+    ## Absolute Standardized Residuals
+    ggplot(model, aes(.fitted, sqrt(abs(.stdresid))))+geom_point(na.rm=TRUE) +
+        stat_smooth(method="loess", na.rm = TRUE)+
+        xlab("Fitted Value") +  ylab(expression(sqrt("|Standardized residuals|"))) + theme_bw()
+
+    ## Cook's distance observations
+    ggplot(model, aes(seq_along(.cooksd), .cooksd))+geom_bar(stat="identity", position="identity") +
+        xlab("Obs. Number")+ylab("Cook's distance") + theme_bw()
+
+    ## Cook's distance
+    ggplot(model, aes(.hat, .stdresid))+geom_point(aes(size=.cooksd), na.rm=TRUE) +
+        stat_smooth(method="loess", na.rm=TRUE) +
+        xlab("Leverage")+ylab("Standardized Residuals") +
+        scale_size_continuous("Cook's Distance", range=c(1,5)) +
+        theme_bw()+theme(legend.position="bottom")
+
+    ## Cook's distance leverage
+    ggplot(model, aes(.hat, .cooksd))+geom_point(na.rm=TRUE)+stat_smooth(method="loess", na.rm=TRUE) +
+        xlab("Leverage hii")+ylab("Cook's Distance") +
+        geom_abline(slope=seq(0,3,0.5), color="gray", linetype="dashed") +
+        theme_bw()
+
+```
+
+<br>
+
+#### Identify outliers in Residuals
+
+Label outliers.
+
+```{r eval=FALSE}
+
+  ## car outlier test
+  car.outlier <- car::outlierTest(lm.step)
+  car.outlier <- as.numeric(names(car.outlier[[1]])) 
+
+  df_XL$discordant_lm1[car.outlier] <- 1
+  df_XL$disc_fields[car.outlier] <- paste0(df_XL$disc_fields[car.outlier], 'residuals | ')
+  df_XL$disc_type[car.outlier] <- paste0(df_XL$disc_type[car.outlier], 'outliers car test | ')
+  remove(car.outlier)
+
+  ## cooksd
+  cooksd <- cooks.distance(lm.step)
+    influential <- as.numeric(names(cooksd)[(cooksd > 4*mean(cooksd, na.rm=T))])  # influential row numbers
+    df_XL$discordant_lm2[influential] <- 1
+    df_XL$disc_fields[influential] <- paste0(df_XL$disc_fields[influential], 'residuals | ')
+    df_XL$disc_type[influential] <- paste0(df_XL$disc_type[influential], 'cooksd | ')
+    
+  ## remove all predictions with error > 100%
+  influential <- as.numeric(rownames(df_pred_LOOCV[which(abs(df_pred_LOOCV[, 'd.lm.base.perc'])>80),]))
+    df_XL$discordant_lm3[influential] <- 1
+    df_XL$disc_fields[influential] <- paste0(df_XL$disc_fields[influential], 'residuals | ')
+    df_XL$disc_type[influential] <- paste0(df_XL$disc_type[influential], 'incourant | ')
+    
+  #df_pred_LOOCV[influential,'BOG_ID']
+
+```
+
+We eyeball potential remaining outliers in the residuals against independent variables.
+
+```{r echo=FALSE}
+
+  model <- lm.base
+
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(purchase_price)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["year_transaction"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["city_category"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(total_LFA)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["building_period"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["EP_energieklasse"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(building_height)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(highway_access_duration)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["walkscore"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["lbm_total_score"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()  
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["vacancy"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(TRI_per_sqm)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw()
+  
+  ## Log transaction price
+  ggplot(model, aes(model[["model"]][["log(WALE)"]], .resid)) + geom_point() +
+      stat_smooth(method="loess") + theme_bw() + xlab()
+  
+```
+
+```{r include = FALSE}
+
+  ## clean up some memory
+  try(remove(lm.bma))
+  try(remove(df_XL.sp))
+  try(remove(gls))
+  try(remove(lm.test))
+  try(remove(mi.test))
+  try(remove(mi.test.se))
+  try(remove(mod.gwr))
+  try(remove(mod.se))
+  try(remove(model))
+  try(remove(nbDists))
+  try(remove(nbList))
+  try(remove(ols))
+  try(remove(swm))
+
+  try(remove(cooksd))
+  try(remove(GWRbandwidth))
+  try(remove(influential))
+  try(remove(reg.formula))
+  try(remove(w))
+  try(remove(dwf))
+
+```
+
+<br>
+
+--- 
+
+# 3. COMPARABLE WEIGHTED REGRESSION (CWR)
+
+<br>
+
+In order to account for the spatiotemporal autocorrelation and heterogeneity in the errors of the baseline regresssion model we run a Weighted regression model. 
+
+The model consists of 2 steps:
+
+- step 1: detemine comparability score
+- step 2: estimate model with score of step 1 as weights
+
+*Note*: We use only the most important variables in terms of explanaotry power to construct our total score. Collective weights are estimated through trial and error.
+
+<br>
+
+#### Comparability Score Function
+
+```{r eval=FALSE}
+  
+  comparability_score <- function(cwr_object, cwr_train){
+    
+      ## create temp df to store z-scores
+      df <- cwr_train
+    
+      ## Standard weights per variable (relative importance comparability)
+      weight_distance <- 3
+      weight_city_category <- 5
+      weight_centrality <- 5
+      weight_transfer_date <- 3
+      weight_LFA <- 2
+      weight_built <- 2 
+      weight_TRI <- 1
+      weight_WALE <- 1
+      weight_walkscore <- 2
+      weight_lbm <- 1
+      
+        # distance between observations and subject proprty (pythagoras on longitude+lattitude)
+        df <- df %>% rowwise() %>%
+              dplyr::mutate(distance = sqrt((longitude-cwr_object$longitude[1])^2 + (latitude-cwr_object$latitude[1])^2))
+        
+        # convert dates to numeric
+        df <- df %>% rowwise() %>%
+              dplyr::mutate(td = as.numeric(transfer_date))
+        cwr_object$td <- as.numeric(cwr_object$transfer_date)
+      
+      ## z-scores per variable
+      df$z.distance <- df$distance / sd(df$distance)
+      df <- df %>% rowwise() %>%
+            dplyr::mutate(z.city_category = ifelse(city_category == cwr_object$city_category[1], 0, 1))
+      df <- df %>% rowwise() %>%
+            dplyr::mutate(z.centrality = ifelse(centrality == cwr_object$centrality[1], 0, 1))
+      df$z.transfer_date <- (df$td - mean(df$td) - (cwr_object$td - mean(df$td))) / sd(df$td)
+      df$z.LFA <- ((df$total_LFA - mean(df$total_LFA)) - (cwr_object$total_LFA - mean(df$total_LFA))) / sd(df$total_LFA)
+      df$z.built <- ((df$year_built - mean(df$year_built)) - (cwr_object$year_built - mean(df$year_built))) / 
+                      sd(df$year_built) 
+      df$z.TRI <- ((df$TRI_per_sqm - mean(df$TRI_per_sqm)) - (cwr_object$TRI_per_sqm - mean(df$TRI_per_sqm))) / sd(df$TRI_per_sqm)
+      df$z.WALE <- ((df$WALE - mean(df$WALE)) - (cwr_object$WALE - mean(df$WALE))) / 
+                     sd(df$WALE)
+      df$z.walkscore <- ((df$walkscore - mean(df$walkscore)) - (cwr_object$walkscore - mean(df$walkscore))) / sd(df$walkscore)
+      df$z.lbm <- ((df$lbm_total_score - mean(df$lbm_total_score)) - (cwr_object$lbm_total_score - mean(df$lbm_total_score))) / 
+                    sd(df$lbm_total_score)
+      
+      ## Overall z-score  
+      df$total_score <- (weight_distance * abs(df$z.distance) +
+                         weight_city_category * abs(df$z.city_category) +
+                         weight_centrality * abs(df$z.centrality) +
+                         weight_transfer_date * abs(df$z.transfer_date) +
+                         weight_LFA * abs(df$z.LFA) +
+                         weight_built * abs(df$z.built) +
+                         weight_TRI * abs(df$z.TRI) +
+                         weight_WALE * abs(df$z.WALE) +
+                         weight_walkscore * abs(df$z.walkscore) +
+                         weight_lbm * abs(df$z.lbm)
+                         )
+      
+      ## Inverse score (and scale from 0 to 100)
+      min_CWR <- min(df$total_score)
+      max_CWR <- max(df$total_score) 
+      df <- df %>% rowwise() %>%
+            dplyr::mutate(COMP_score = abs((total_score - min_CWR) / (max_CWR - min_CWR)* 100 - 100)) 
+      
+      ## Append total score to original df
+      cwr_train$COMP_score <- df$COMP_score
+    
+    return(cwr_train)
+  }
+
+```
+
+```{r include=FALSE}
+
+  ## set empty dataframe for coefficient results (vary per observation)
+  df_coef <- data.frame(BOG_ID = df_XL$BOG_ID,
+                        LFA = NA,
+                        height = NA,
+                        parking_spots = NA,
+                        energy_below_C = NA,
+                        energy_C = NA,
+                        energy_B = NA,
+                        energy_above_A = NA,
+                        built_before_1906 = NA,
+                        built_1906 = NA,
+                        built_1945 = NA,
+                        built_1971 = NA,
+                        built_1991 = NA,
+                        built_2001 = NA,
+                        walkscore = NA,
+                        leefbaarometer = NA,
+                        TRI_per_sqm = NA,
+                        vacancy = NA,
+                        WALE = NA,
+                        underrented = NA,
+                        overrented = NA,
+                        city_large = NA,
+                        year_2010 = NA,
+                        year_2011 = NA,
+                        year_2012 = NA,
+                        year_2013= NA,
+                        year_2014= NA,
+                        year_2015= NA,
+                        year_2016= NA,
+                        year_2018= NA,
+                        intercept= NA,
+                        R2= NA
+                        )
+```
+
+<br>
+
+## 3.1 - Baseline CWR model
+
+Use baseline (full) specification as regression formula.
+
+TO DO: Regression with only above 60% comparability (kinda like kNN)
+
+<br>
+
+#### LOOCV - Baseline Formulation
+
+```{r eval=FALSE}
+
+  ## loop through each row and run a local regression
+  for (k in 1:nrow(df_XL)){ 
+  
+    ## set data
+    cwr_object <- df_XL[k, ]   # subject property
+    cwr_train  <- df_XL[-k, ]  # training data (excl. subject property)
+
+    ## get df which includes comparability scores (weights) to subject property
+    cwr_train <- comparability_score(cwr_object, cwr_train)
+    
+    ## run WLS regression and predict
+    cwr.base   <- lm(data= cwr_train, formula = lm.base.formula, weights = COMP_score)
+    cwr.pred <- predict(cwr.base, cwr_object)
+      
+    ## store predicted value
+    df_pred_LOOCV$cwr.base[k] <- exp(cwr.pred)
+    
+  } # repeat k-times (for every object, like LOOCV)
+    
+  ## overall model accuracy
+  out.row <- 8
+  rownames(df_pred_acc)[out.row] <- "cwr.base"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$cwr.base)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$cwr.base) * 100
+    
+```
+
+<br>
+
+#### Simulation 2018 - Baseline Formulation
+
+```{r eval=FALSE}  
+  
+    ## set data
+    cwr_train <- df_XL %>% dplyr::filter(year_transaction != 2018) # exclude 2018 from train 
+    cwr_test_2018 <- df_XL %>% dplyr::filter(year_transaction == 2018)  # test set with only 2018
+    
+    ## adjust data where we assume that 2018 = 2017 dummy
+    cwr_test_2018 <- cwr_test_2018 %>% rowwise %>% dplyr::mutate(year_transaction = 2017)
+    cwr_test_2018$year_transaction <- as.factor(cwr_test_2018$year_transaction) 
+      
+    ## loop through each row and run a local regression
+    for (k in 1:nrow(cwr_test_2018)){ 
+    
+      ## set data
+      cwr_object <- cwr_test_2018[k, ] # subject property
+      cwr_object$COMP_score <- 100
+      
+      ## get df which includes comparability scores (weights) to subject property
+      cwr_train <- comparability_score(cwr_object, cwr_train)
+      
+      ## run WLS regression and predict
+      cwr.base   <- lm(data= cwr_train, formula = lm.base.formula, weights = COMP_score)
+      cwr.pred <- predict(cwr.base, cwr_object)
+        
+      ## store predicted value
+      df_pred_2018$cwr.base[k] <- exp(cwr.pred)
+      
+      ## add subject to training sample
+      cwr_train <- rbind(cwr_train, cwr_object)
+      
+    } # repeat k-times (for every object, like LOOCV)
+    
+  ## overall model accuracy
+  out.row <- 8
+  rownames(df_pred_acc)[out.row] <- "cwr.base"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$cwr.base)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$cwr.base) * 100
+
+  df_pred_acc[6:out.row,]
+  
+```
+
+#### Model Performance [CWR Baseline model specification]
+
+```{r include = FALSE}
+  
+  ## output IDs
+  out.row <- 8
+  out.name <- 'cwr.base'
+
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.cwr.perc)
+  
+  ## Show results
+  df_pred_acc[1:out.row,]
+  
+```  
+  
+<br>
+
+## 3.2 - Stepwise CWR model
+
+We Repeat the above CWR process, but this time with the formulation results of the Stepwise regression.
+
+#### LOOCV - Stepwise Formulation
+
+```{r eval=FALSE, include=FALSE}
+
+  ## loop through each row and run a local regression
+  for (k in 1:nrow(df_XL)){ 
+  
+    ## set data
+    cwr_object <- df_XL[k, ]   # subject property
+    cwr_train  <- df_XL[-k, ]  # training data (excl. subject property)
+
+    ## get df which includes comparability scores (weights) to subject property
+    cwr_train <- comparability_score(cwr_object, cwr_train)
+    
+    ## run WLS regression and predict
+    cwr.step   <- lm(data= cwr_train, formula = lm.step.formula, weights = COMP_score)
+    cwr.pred   <- predict(cwr.step, cwr_object)
+      
+    ## store predicted value
+    df_pred_LOOCV$cwr.step[k] <- exp(cwr.pred)
+    
+    ## store coeff
+      df_coef$intercept[k] <- cwr.step[["coefficients"]][["(Intercept)"]]
+      df_coef$LFA[k] <- cwr.step[["coefficients"]][["log(total_LFA)"]]
+      df_coef$height[k] <- cwr.step[["coefficients"]][["log(building_height)"]]
+      df_coef$parking_spots[k] <- cwr.step[["coefficients"]][["parking_spots"]]
+      df_coef$energy_below_C[k] <- cwr.step[["coefficients"]][["EP_energieklassebelow_C"]]
+      df_coef$energy_C[k] <- cwr.step[["coefficients"]][["EP_energieklasseC"]]
+      df_coef$energy_B[k] <- cwr.step[["coefficients"]][["EP_energieklasseB"]]
+      df_coef$energy_above_A[k] <- cwr.step[["coefficients"]][["EP_energieklasseAbove_A"]]
+      df_coef$built_before_1906[k] <- cwr.step[["coefficients"]][["building_periodbefore_1906"]]
+      df_coef$built_1906[k] <- cwr.step[["coefficients"]][["building_period1906-1944"]]
+      df_coef$built_1945[k] <- cwr.step[["coefficients"]][["building_period1945-1970"]]
+      df_coef$built_1971[k] <- cwr.step[["coefficients"]][["building_period1971-1990"]]
+      df_coef$built_1991[k] <- cwr.step[["coefficients"]][["building_period1991-2000"]]
+      df_coef$built_2001[k] <- cwr.step[["coefficients"]][["building_period2001-2010"]]
+      df_coef$walkscore[k] <- cwr.step[["coefficients"]][["walkscore"]]
+      df_coef$leefbaarometer[k] <- cwr.step[["coefficients"]][["lbm_total_score"]]
+      df_coef$TRI_per_sqm[k] <- cwr.step[["coefficients"]][["log(TRI_per_sqm)"]]
+      df_coef$vacancy[k] <- cwr.step[["coefficients"]][["vacancy"]]
+      df_coef$overrented[k] <- cwr.step[["coefficients"]][["underrentedOVER"]]
+      df_coef$underrented[k] <- cwr.step[["coefficients"]][["underrentedUNDER"]]
+      df_coef$WALE[k] <- cwr.step[["coefficients"]][["log(WALE)"]]
+      df_coef$city_large[k] <- cwr.step[["coefficients"]][["city_categorylarge"]]
+      df_coef$year_2010[k] <- cwr.step[["coefficients"]][["year_transaction2010"]]
+      df_coef$year_2011[k] <- cwr.step[["coefficients"]][["year_transaction2011"]]
+      df_coef$year_2012[k] <- cwr.step[["coefficients"]][["year_transaction2012"]]
+      df_coef$year_2013[k] <- cwr.step[["coefficients"]][["year_transaction2013"]]
+      df_coef$year_2014[k] <- cwr.step[["coefficients"]][["year_transaction2014"]]
+      df_coef$year_2015[k] <- cwr.step[["coefficients"]][["year_transaction2015"]]
+      df_coef$year_2016[k] <- cwr.step[["coefficients"]][["year_transaction2016"]]
+      df_coef$year_2018[k] <- cwr.step[["coefficients"]][["year_transaction2018"]]
+    df_coef$R2[k] <- summary(cwr.step)[["adj.r.squared"]]
+
+  } # repeat k-times (for every object, like LOOCV)
+    
+  ## overall model accuracy
+  out.row <- 9
+  rownames(df_pred_acc)[out.row] <- "cwr.step"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$cwr.step)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$cwr.step) * 100
+
+```
+
+<br>
+
+#### Simulation 2018 - Stepwise Formulation
+
+```{r eval=FALSE, echo=TRUE} 
+  
+    ## set data
+    cwr_train <- df_XL %>% dplyr::filter(year_transaction != 2018) # exclude 2018 from train 
+    cwr_test_2018 <- df_XL %>% dplyr::filter(year_transaction == 2018)  # test set with only 2018
+    
+    ## adjust data where we assume that 2018 = 2017 dummy
+    cwr_test_2018 <- cwr_test_2018 %>% rowwise %>% dplyr::mutate(year_transaction = 2017)
+    cwr_test_2018$year_transaction <- as.factor(cwr_test_2018$year_transaction) 
+      
+    ## loop through each row and run a local regression
+    for (k in 1:nrow(cwr_test_2018)){ 
+    
+      ## set data
+      cwr_object <- cwr_test_2018[k, ] # subject property
+      cwr_object$COMP_score <- 100
+      
+      ## get df which includes comparability scores (weights) to subject property
+      cwr_train <- comparability_score(cwr_object, cwr_train)
+      
+      ## run WLS regression and predict
+      cwr.step   <- lm(data= cwr_train, formula = lm.step.formula, weights = COMP_score)
+      cwr.pred   <- predict(cwr.step, cwr_object)
+        
+      ## store predicted value
+      df_pred_2018$cwr.step[k] <- exp(cwr.pred)
+
+      ## add subject to training sample
+      cwr_train <- rbind(cwr_train, cwr_object)
+      
+    } # repeat k-times (for every object, like LOOCV)
+    
+  ## overall model accuracy
+  out.row <- 9
+  rownames(df_pred_acc)[out.row] <- "cwr.step"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$cwr.step)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$cwr.step) * 100
+
+  df_pred_acc[6:out.row,]
+  
+```
+
+#### Model Performance [CWR Stepwise model specification]
+
+```{r include = FALSE}
+  
+  ## output IDs
+  out.row <- 9
+  out.name <- 'cwr.step'
+
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.cwr.perc)
+  
+  ## Show results
+  df_pred_acc[1:out.row,]
+  
+```  
+
+As the stepwise had higher prediction accuracy than the base model, we continuou with this specification for the CWR analyis.
+
+#### Summary statistics of CWR results (stepwise)
+
+```{r}
+
+  ## summary function
+  fullSummary <- function(x){
+    
+    N <- length(na.omit(x))
+    StDev <- sd(x)
+    Min <- min(x)
+    Pctl.50 <- quantile(x, .50)
+    Mean <- mean(x)
+    Max <- max(x)
+    Skew <- skewness(x)
+    Kurt <- kurtosis(x)
+    
+    return(c(N = N,
+             Mean=Mean,
+             StDev=StDev,
+             Min = Min,
+             Median=Pctl.50, 
+             Max=Max,
+             Skew=Skew,
+             Kur=Kurt
+             ))}
+    
+  ## plot summary results
+  summ.table <- t(do.call(cbind, lapply(df_coef, fullSummary)))
+  summ.table
+
+  ## export as excel
+  write.csv(summ.table, file = "temp.csv")
+
+```
+
+<br>
+
+## 3.3 - Residual Analysis
+
+#### Graph - Prediction Accuracy Distribution [CWR Model]
+
+```{r include=FALSE}
+
+    df_pred_2018$d.cwr <- df_pred_2018$actual - df_pred_2018$cwr
+    df_pred_2018$d.cwr.perc <- df_pred_2018$d.cwr / df_pred_2018$actual * 100
+    
+    df_pred_LOOCV$d.cwr<- df_pred_LOOCV$actual - df_pred_LOOCV$cwr
+    df_pred_LOOCV$d.cwr.perc <- df_pred_LOOCV$d.cwr / df_pred_LOOCV$actual * 100
+   
+```
+
+```{r message=FALSE, warning=FALSE}
+
+ ## view output
+  ggplot(data=df_pred_LOOCV, aes(x=d.cwr.perc)) + theme_bw() +
+    geom_density(fill='#A4A4A4', alpha = 0.5) +
+    geom_density(data=df_pred_2018, aes(x=d.cwr.perc), size=1, linetype='dotdash') +
+    geom_vline(aes(xintercept=mean(d.cwr.perc)), colour="darkred", linetype="dashed", size=1) +
+    labs(title="CWR Regression", x ="", y = "") + xlim(c(-100,100))
+  
+```
+
+```{r include = FALSE}
+
+  ## clean up some memory
+  try(remove(df_coef))
+  try(remove(cwr_object))
+  try(remove(cwr_train))
+  try(remove(cwr_test_2018))
+  try(remove(cwr.pred))
+
+```
+
+<br>
+
+---
+
+# 4. RANDOM FOREST
+
+<br>
+
+We start Machine Learning with the Random Forest Model. This model has the advantage that it is easy to use with little hyperparameters to tune and has some inbuilt robustness against overfitting. It thus a good starting point for our machine learning analysis 
+
+example:
+http://www.rebeccabarter.com/blog/2017-11-17-caret_tutorial/
+
+<br>
+
+#### Variable Selection
+
+In order to provide an fair comparison between the Hedonic Regression model and Machine Learning Techniques we first include the same variables. This potentially reveals the non-parametric characteristics of real estate factors.
+
+Since the most machine learning algorithms cannot transform variables within the function, we need to create the transformed variables first.
+
+```{r  eval=FALSE}
+
+  ## dependent variable
+  df_XL$log_purchase_price <- log(df_XL$purchase_price)
+  dep.var <- "log_purchase_price"
+  
+  ## independent variable(s)
+  df_XL$log_total_LFA <- log(df_XL$total_LFA)
+  df_XL$log_building_height <- log(df_XL$building_height)
+  df_XL$log_train_station_duration <- log(df_XL$train_station_duration)
+  df_XL$log_highway_access_duration <- log(df_XL$highway_access_duration)
+  df_XL$log_TRI_per_sqm <- log(df_XL$TRI_per_sqm)
+  df_XL$log_WALE <- log(df_XL$WALE)
+
+  ind.vars <- c("log_total_LFA",
+                "log_building_height",
+                "parking_spots",
+                "EP_energieklasse",
+                "building_period",
+                "walkscore",
+                "lbm_total_score",
+                "log_train_station_duration",
+                "log_highway_access_duration",
+                "log_TRI_per_sqm",
+                "vacancy",
+                "log_WALE",
+                "underrented",
+                "CW_district_type",
+                "city_category",
+                "centrality",
+                "year_transaction")
+    
+  ## refresh splits train/test
+  df_train <- df_XL[split == 1, ]
+  df_test <- df_XL[split == 2, ]
+  
+  ## lm formula
+  ml.formula <- as.formula(paste(dep.var, '~', paste(ind.vars, collapse="+")))
+  ml.formula
+
+```
+
+*Note*: We use the Baseline model specification instead of the Stepwise model specification as these provide higher accuracy.
+
+<br>
+
+## 4.1 - Baseline Random Forest
+
+First, we run a standard Random Forest model as a reference before tuning the hyperparameters.
+
+```{r eval=FALSE}
+ 
+  ## regression model
+  rf.base <-randomForest(ml.formula,
+                         data = df_train,
+                         importance = TRUE,
+                         ntree = 300,
+                         nodesize = 7)
+ 
+  ## view output
+  rf.base
+  
+  ## output IDs
+  out.row <- 10
+  out.name <- 'rf.base'
+  
+```
+
+#### Graph - Optimal Number of Trees
+
+Next, we look at optimal number of trees is necesary in order to decrease our loss. From a plot we see that after 100 trees our model does not imrove a lot anymore and could be seen as a break point in order to increase the speed of our model.
+
+```{r eval=FALSE}
+
+  ## plot trees
+  plot(rf.base)
+
+```
+
+#### Model Performance [Random Forest Base Regression]
+
+Last, we add the prediction accuracy of this model to our prediction dataframes
+
+**LEAVE ONE OUT CROSS VALIDATION (LOOCV)**
+
+```{r eval=FALSE}  
+
+  for (k in 1:nrow(df_XL)) {
+  
+    ## set data
+    loocv_train <- df_XL[-k, ] # every observation except k
+    loocv_test  <- df_XL[k, ]  # test set with only observation k
+    
+    ## A very nasty feature of the random forest algorithm is that the level space for test and train 
+    ## needs to be identical. We thus need to correct the factors first
+    levels(loocv_test$year_transaction) <- levels(loocv_train$year_transaction)
+    levels(loocv_test$halfyear_transaction) <- levels(loocv_train$halfyear_transaction)
+    levels(loocv_test$building_period) <- levels(loocv_train$building_period)
+    levels(loocv_test$building_period_renov) <- levels(loocv_train$building_period_renov)
+    levels(loocv_test$COROP_region) <- levels(loocv_train$COROP_region)
+    levels(loocv_test$city_category) <- levels(loocv_train$city_category)
+    levels(loocv_test$centrality) <- levels(loocv_train$centrality)
+    levels(loocv_test$CW_district_type) <- levels(loocv_train$CW_district_type)
+    levels(loocv_test$underrented) <- levels(loocv_train$underrented)
+  
+    ## regression Model
+    model.res <-randomForest(ml.formula,
+                             data = loocv_train,
+                             importance = TRUE,
+                             ntree = 300,
+                             nodesize = 7)
+
+    ## prediction results
+    model.pred <- predict(model.res, loocv_test)
+    df_pred_LOOCV$rf.base[k] <- exp(model.pred)
+
+  } # repeat k-times (for every object once)
+    
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "rf.base"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$rf.base)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$rf.base) * 100
+  
+```
+
+**SIMULATION 2018 LOOCV**
+
+```{r eval=FALSE}  
+
+  sim2018_train <- df_XL %>% dplyr::filter(year_transaction != 2018) # exclude 2018 from train 
+  sim2018_test <- df_XL %>% dplyr::filter(year_transaction == 2018)  # test set with only 2018
+  
+  ## adjust data where we assume that 2018 = 2017 dummy
+  sim2018_test <- sim2018_test %>% rowwise %>% dplyr::mutate(year_transaction = 2017)
+  sim2018_test$year_transaction <- as.factor(sim2018_test$year_transaction)
+  
+  ## Again, make levels same in the test set
+  levels(sim2018_test$year_transaction) <- levels(sim2018_train$year_transaction)
+  levels(sim2018_test$halfyear_transaction) <- levels(sim2018_train$halfyear_transaction)
+  levels(sim2018_test$building_period) <- levels(sim2018_train$building_period)
+  levels(sim2018_test$building_period_renov) <- levels(sim2018_train$building_period_renov)
+  levels(sim2018_test$COROP_region) <- levels(sim2018_train$COROP_region)
+  levels(sim2018_test$city_category) <- levels(sim2018_train$city_category)
+  levels(sim2018_test$centrality) <- levels(sim2018_train$centrality)
+  levels(sim2018_test$CW_district_type) <- levels(sim2018_train$CW_district_type)
+  levels(sim2018_test$underrented) <- levels(sim2018_train$underrented)
+  
+  ## loop from begin 2018 to last observation
+  for (k in 1:nrow(sim2018_test)) {
+    
+    ## set subject object
+    object <- sim2018_test[k, ]
+   
+    ## regression Model
+    model.res <-randomForest(ml.formula,
+                             data = sim2018_train,
+                             importance = TRUE,
+                             ntree = 300,
+                             nodesize = 7)
+    
+    ## prediction results
+    model.pred <- predict(model.res, object)
+    df_pred_2018$rf.base[k] <- exp(model.pred)
+    
+    ## add newdata to the training set
+    sim2018_train <- rbind(sim2018_train, object)
+
+  } # repeat k-times (for every object once)
+  
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "rf.base"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$rf.base)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$rf.base) * 100
+  
+```
+
+**HOLDOUT SAMPLE**
+
+```{r eval=FALSE}
+  
+  ## out-of-sample
+  df_pred_out <- out_of_sample_results(out.row,out.name,rf.base)$df_pred_out
+  df_pred_acc <- out_of_sample_results(out.row,out.name,rf.base)$df_pred_acc
+  df_pred_out$d.rf.base <- df_pred_out$actual - df_pred_out$rf.base
+  df_pred_out$d.rf.base.perc <- df_pred_out$d.rf.base / df_pred_out$actual * 100
+
+  ## in-sample
+  df_pred_in <- in_sample_results(out.row,out.name,rf.base)$df_pred_in
+  df_pred_acc <- in_sample_results(out.row,out.name,rf.base)$df_pred_acc
+  
+  ## LOOCV
+  df_pred_2018$d.rf.base <- df_pred_2018$actual - df_pred_2018$rf.base
+  df_pred_2018$d.rf.base.perc <- df_pred_2018$d.rf.base / df_pred_2018$actual * 100
+    
+  ## Sim 2018
+  df_pred_LOOCV$d.rf.base <- df_pred_LOOCV$actual - df_pred_LOOCV$rf.base
+  df_pred_LOOCV$d.rf.base.perc <- df_pred_LOOCV$d.rf.base / df_pred_LOOCV$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.rf.base.perc)
+  
+  ## Show results
+  df_pred_acc[out.row, "R2"] <- max(rf.base[["rsq"]])
+  df_pred_acc[6:out.row,]
+  
+```
+
+---
+
+<br>
+
+## 4.2 - Tuned Random Forest
+
+In order to sqeeze more performance out of the random forest model the hyperparameters can be tuned to their optimal settings. Here we use the automated *grid-search of the caret-package* to test different values to find the lowest cross-validated error. 
+
+```{r  eval=FALSE}
+
+  ## train model to optimal parameters
+  train_control <- trainControl(method="cv")
+  rf.train <- train(form = ml.formula,
+                    data = df_train,
+                    trControl = train_control,
+                    na.action=na.roughfix,
+                    method = "rf",
+                    metric = "RMSE") # hyperparamaters tuning: mtry
+  
+  ## Output tuned RF
+  rf.train
+  
+```
+
+We reastimate the model with the optimal hyperparameters settings in order to check the results.
+
+```{r  eval=FALSE}
+
+  ## regression model
+  rf.tuned =  randomForest(form = ml.formula, 
+                           data = df_train, 
+                           ntree=200,
+                           nodesize=5, 
+                           mtry=rf.train[["bestTune"]][["mtry"]],
+                           importance = TRUE)
+
+  ## show output tuned RF model
+  rf.tuned
+  
+  ## ouput IDs
+  out.row <- 11
+  out.name <- 'rf.tuned'
+
+```
+
+#### Prediction Accuracy
+
+Last, we again add the prediction accuracy of this model to our dataframe.
+
+```{r eval=FALSE, include=FALSE}  
+  
+  ## LEAVE ONE OUT CROSS VALIDATION (LOOCV) ##
+
+  for (k in 1:nrow(df_XL)) {
+  
+    ## set data
+    loocv_train <- df_XL[-k, ] # every observation except k
+    loocv_test  <- df_XL[k, ]  # test set with only observation k
+    
+    ## Again, make levels same in the test set
+    levels(loocv_test$year_transaction) <- levels(loocv_train$year_transaction)
+    levels(loocv_test$halfyear_transaction) <- levels(loocv_train$halfyear_transaction)
+    levels(loocv_test$building_period) <- levels(loocv_train$building_period)
+    levels(loocv_test$building_period_renov) <- levels(loocv_train$building_period_renov)
+    levels(loocv_test$COROP_region) <- levels(loocv_train$COROP_region)
+    levels(loocv_test$city_category) <- levels(loocv_train$city_category)
+    levels(loocv_test$centrality) <- levels(loocv_train$centrality)
+    levels(loocv_test$CW_district_type) <- levels(loocv_train$CW_district_type)
+    levels(loocv_test$underrented) <- levels(loocv_train$underrented)
+  
+    ## regression Model
+    model.res =  randomForest(form = ml.formula,
+                              data = loocv_train, 
+                              ntree=200,
+                              nodesize=5, 
+                              mtry=18, #rf.train[["bestTune"]][["mtry"]],
+                              importance = FALSE)
+
+    ## prediction results
+    model.pred <- predict(model.res, loocv_test)
+    df_pred_LOOCV$rf.tuned[k] <- exp(model.pred)
+
+  } # repeat k-times (for every object once)
+    
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "rf.tuned"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$rf.tuned)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$rf.tuned) * 100
+  
+```
+
+```{r eval=FALSE, include=FALSE}  
+  
+  ## SIMULATION 2018 LOOCV ##
+
+  sim2018_train <- df_XL %>% dplyr::filter(year_transaction != 2018) # exclude 2018 from train 
+  sim2018_test <- df_XL %>% dplyr::filter(year_transaction == 2018)  # test set with only 2018
+  
+  ## adjust data where we assume that 2018 = 2017 dummy
+  sim2018_test <- sim2018_test %>% rowwise %>% dplyr::mutate(year_transaction = 2017)
+  sim2018_test$year_transaction <- as.factor(sim2018_test$year_transaction)
+  
+  ## Again, make levels same in the test set
+  levels(sim2018_test$year_transaction) <- levels(sim2018_train$year_transaction)
+  levels(sim2018_test$halfyear_transaction) <- levels(sim2018_train$halfyear_transaction)
+  levels(sim2018_test$building_period) <- levels(sim2018_train$building_period)
+  levels(sim2018_test$building_period_renov) <- levels(sim2018_train$building_period_renov)
+  levels(sim2018_test$COROP_region) <- levels(sim2018_train$COROP_region)
+  levels(sim2018_test$city_category) <- levels(sim2018_train$city_category)
+  levels(sim2018_test$centrality) <- levels(sim2018_train$centrality)
+  levels(sim2018_test$CW_district_type) <- levels(sim2018_train$CW_district_type)
+  levels(sim2018_test$underrented) <- levels(sim2018_train$underrented)
+
+  ## loop from begin 2018 to last observation
+  for (k in 1:nrow(sim2018_test)) {
+    
+    ## set subject object
+    object <- sim2018_test[k, ]
+   
+    ## regression Model
+    model.res =  randomForest(form = ml.formula, 
+                             data = sim2018_train, 
+                             ntree=200,
+                             nodesize=5, 
+                             mtry= 18, #rf.train[["bestTune"]][["mtry"]],
+                             importance = FALSE)
+      
+    ## prediction results
+    model.pred <- predict(model.res, object)
+    df_pred_2018$rf.tuned[k] <- exp(model.pred)
+    
+    ## add newdata to the training set
+    sim2018_train <- rbind(sim2018_train, object)
+
+  } # repeat k-times (for every object once)
+  
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "rf.tuned"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$rf.tuned)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$rf.tuned) * 100
+  
+```
+
+```{r eval=FALSE}
+  
+  ## out-of-sample
+  df_pred_out <- out_of_sample_results(out.row,out.name,rf.tuned)$df_pred_out
+  df_pred_acc <- out_of_sample_results(out.row,out.name,rf.tuned)$df_pred_acc
+  df_pred_out$d.rf.tuned <- df_pred_out$actual - df_pred_out$rf.tuned
+  df_pred_out$d.rf.tuned.perc <- df_pred_out$d.rf.tuned / df_pred_out$actual * 100
+
+  ## in-sample
+  df_pred_in <- in_sample_results(out.row,out.name,rf.tuned)$df_pred_in
+  df_pred_acc <- in_sample_results(out.row,out.name,rf.tuned)$df_pred_acc
+  
+  ## LOOCV
+  df_pred_2018$d.rf.tuned <- df_pred_2018$actual - df_pred_2018$rf.tuned
+  df_pred_2018$d.rf.tuned.perc <- df_pred_2018$d.rf.tuned / df_pred_2018$actual * 100
+    
+  ## Sim 2018
+  df_pred_LOOCV$d.rf.tuned <- df_pred_LOOCV$actual - df_pred_LOOCV$rf.tuned
+  df_pred_LOOCV$d.rf.tuned.perc <- df_pred_LOOCV$d.rf.tuned / df_pred_LOOCV$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.rf.tuned.perc)
+  
+  ## Show results
+  df_pred_acc[out.row, "R2"] <- max(rf.tuned[["rsq"]])
+  df_pred_acc[6:out.row,]
+  
+```
+
+
+#### Graph - Prediction Accuracy Distribution [RF Model]
+
+```{r warning=FALSE}
+
+ ## view output
+  ggplot(data=df_pred_out, aes(x=d.rf.tuned.perc)) + theme_bw() +
+    geom_density(fill='#A4A4A4', alpha = 0.5) +
+    geom_density(data=df_pred_2018, aes(x=d.rf.tuned.perc), size=1, linetype='dotdash') +
+    geom_vline(aes(xintercept=mean(d.rf.tuned.perc)), colour="darkred", linetype="dashed", size=1) +
+    labs(title="Baseline Regression", x ="", y = "") + xlim(c(-100,100))
+  
+```
+
+<br>
+
+## 4.3 - Variable importance
+
+Last, we check the variable importance from the Random Forest Model
+
+```{r}
+  # get list with importance of each variable
+  MR_imp <- data.frame(varImp(rf.base))
+  colnames(MR_imp) = "MR_imp"
+  MR_imp <- data.frame(MR_imp=MR_imp$MR_imp[order(-MR_imp$MR_imp)],
+                       row.names = row.names(MR_imp)[order(-MR_imp$MR_imp)])
+  MR_imp[,1] <- MR_imp[,1] /100 # scale 0-1
+  
+  # plot variable importance
+  par(las=1) # make label text perpendicular to axis
+  par(mar=c(2,10,4,2)) # increase y-axis margin.
+  barplot(MR_imp$MR_imp, main="Random Forest (Standard) - Variable Importance", horiz=TRUE, 
+          names.arg=c(row.names(MR_imp)), cex.names=0.8, col='#357CA3', density=30)
+  
+```
+
+And compare against the Variable Importance tuned Random Forest Model: 
+```{r echo=FALSE}
+
+  # get list with importance of each variable
+  MR_imp <- data.frame(varImp(rf.tuned))
+  colnames(MR_imp) = "MR_imp"
+  MR_imp <- data.frame(MR_imp=MR_imp$MR_imp[order(-MR_imp$MR_imp)],
+                       row.names = row.names(MR_imp)[order(-MR_imp$MR_imp)])
+  MR_imp[,1] <- MR_imp[,1] /100 # scale 0-1
+  col.sum <-colSums(MR_imp, dims=1)[1]
+  MR_imp[,2] <- MR_imp[,1] / col.sum[1] 
+
+  # plot variable importance
+  par(las=1) # make label text perpendicular to axis
+  par(mar=c(3,10,4,2)) # increase y-axis margin.
+  
+  barplot(MR_imp[,2], main="Random Forest (Tuned) - Variable Importance", horiz=TRUE, 
+          names.arg=c(row.names(MR_imp)), cex.names=0.8, col='#357CA3', density=30)
+        
+```
+
+```{r eval=FALSE, include=FALSE}
+
+  ## Clear Some Memory ##
+  try(remove(rf.train))
+  try(remove(model.res))
+  try(remove(MR_imp))
+  try(remove(object))
+  try(remove(sim2018_test))
+  try(remove(sim2018_train))
+  try(remove(train_control))
+
+```
+
+<br>
+
+---
+
+# 5. GRADIENT BOOSTING (XGBOOST)
+
+<br>
+
+The second and last machine learning model we apply is the Gradient Boosted Tree (XGBoost). This model is often mentioned to provide excellent performance and speed. The technique however is more difficult to apply than Random Forest due to its many parameters and use of sparse matrices.
+
+Prepare the data
+
+```{r eval=FALSE}
+
+  ## Selection variables and Sparse Matrix
+  matrix_XL <- dplyr::select(.data=df_XL, dep.var, ind.vars)
+  matrix_XL <- predict(dummyVars(~., data = matrix_XL, fullRank = TRUE), matrix_XL)
+    xgb_XL <- xgb.DMatrix(data = matrix_XL[,-1], label = matrix_XL[,1], missing=NA)
+  
+  ## Train set tbv XGB
+  matrix_train <- matrix_XL[split == 1, ]
+    xgb_train <- xgb.DMatrix(data = matrix_train[,-1], label = matrix_train[,1], missing=NA)  
+  
+  ## Test set tbv XGB
+  matrix_test <- matrix_XL[split == 2, ]
+    xgb_test <- xgb.DMatrix(data = matrix_test[,-1], label = matrix_test[,1], missing=NA)  
+    
+```
+
+
+## 5.1 - Base XGBoost Model
+
+We first build our model using default parameters.
+
+```{r eval=FALSE}
+  
+  # default parameters
+  XGB_params <- list(#booster = "gbtree", 
+                     objective = "reg:linear", 
+                     eta=0.3, 
+                     base_score = 0.5,
+                     gamma=0, 
+                     max_depth=6, 
+                     min_child_weight=1, 
+                     subsample=1, 
+                     colsample_bytree=1)
+  
+  # first default - model training
+  xgb.base <- xgboost(data = xgb_train,
+                      params = XGB_params,
+                      print_every_n = 50,
+                      nrounds = 200)
+
+  ## output IDs
+  out.row <- 12
+  out.name <- 'xgb.base'
+  
+```
+
+#### Prediction Accuracy XGB Base
+
+We again add the prediction accuracy of this model to our dataframe.
+
+**LEAVE ONE OUT CROSS VALIDATION (LOOCV)**
+
+```{r eval=FALSE} 
+
+  for (k in 1:nrow(matrix_XL)) {
+ 
+    ## set data
+    loocv_train <- matrix_XL[-k, ] # every observation except k
+                   # make xgb matrix to train model
+                   loocv_train <- xgb.DMatrix(data = loocv_train[,-1], 
+                                              label = loocv_train[,1], 
+                                              missing = NA)
+    x_pred <- t(as.matrix(matrix_XL[k, -1])) # 'newdata' k (excluding dep var)
+    
+    ## regression Model
+    model.res <- xgboost(data = loocv_train,
+                         params = XGB_params,
+                         verbose = 0, #hide process
+                         nrounds = 200)
+
+    ## prediction results
+    model.pred <- predict(model.res, x_pred)
+    df_pred_LOOCV$xgb.base[k] <- exp(model.pred) # transform log back 
+
+  } # repeat k-times (for every object)
+    
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "xgb.base"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$xgb.base)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$xgb.base) * 100
+
+```
+
+**SIMULATION 2018 (LOOCV)**
+
+```{r results='hide'}
+
+  sim2018_train <- matrix_XL[matrix_XL[, "year_transaction.2018"] != 1,]
+  sim2018_test  <- matrix_XL[matrix_XL[, "year_transaction.2018"] == 1,]
+
+  ## adjust data where we assume that 2018 = 2017
+  sim2018_test[,'year_transaction.2018'] <- 0
+  
+  ## loop from begin 2018 to last observation in 2018
+  for (k in 1:nrow(sim2018_test)) {
+    
+    ## set xgb data
+    xgb.sim2018_train <- xgb.DMatrix(data = sim2018_train[,-1], 
+                                     label = sim2018_train[,1], 
+                                     missing=NA)
+    x_pred <- t(as.matrix(sim2018_test[k, -1])) # newdata
+
+    ## regression Model
+    model.res <- xgboost(data = xgb.sim2018_train,
+                         params = XGB_params,
+                         verbose = 0, # hide process
+                         nrounds = 200)
+    
+    ## prediction results
+    model.pred <- predict(model.res, x_pred)
+    df_pred_2018$xgb.base[k] <- exp(model.pred)
+    
+    ## add newdata to the training set
+    sim2018_train <- rbind(sim2018_train, sim2018_test[k,])
+
+  } # repeat k-times
+  
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "xgb.base"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$xgb.base)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$xgb.base) * 100
+  
+```
+
+**HOLDOUT-SAMPLE**
+
+```{r  eval=FALSE}
+
+  ## Out-of-sample
+  xgb.base.pred <- predict(xgb.base, xgb_test)
+  df_pred_out$xgb.base <- exp(xgb.base.pred)
+  df_pred_out$d.xgb.base <- df_pred_out$actual - df_pred_out$xgb.base
+  df_pred_out$d.xgb.base.perc <- df_pred_out$d.xgb.base / df_pred_out$actual * 100
+  df_pred_acc$rmse_out[out.row] <- Metrics::rmse(df_pred_out$actual, df_pred_out$xgb.base)
+  df_pred_acc$mape_out[out.row] <- Metrics::mape(df_pred_out$actual, df_pred_out$xgb.base) * 100
+    
+  ## In-sample
+  xgb.base.pred <- predict(xgb.base, xgb_train)
+  df_pred_in$xgb.base <- exp(xgb.base.pred)
+  df_pred_acc$rmse_in[out.row] <- Metrics::rmse(df_pred_in$actual, df_pred_in$xgb.base)
+  df_pred_acc$mape_in[out.row] <- Metrics::mape(df_pred_in$actual, df_pred_in$xgb.base) * 100
+    
+  ## LOOCV
+  df_pred_2018$d.xgb.base <- df_pred_2018$actual - df_pred_2018$xgb.base
+  df_pred_2018$d.xgb.base.perc <- df_pred_2018$d.xgb.base / df_pred_2018$actual * 100
+    
+  ## Sim 2018
+  df_pred_LOOCV$d.xgb.base <- df_pred_LOOCV$actual - df_pred_LOOCV$xgb.base
+  df_pred_LOOCV$d.xgb.base.perc <- df_pred_LOOCV$d.xgb.base / df_pred_LOOCV$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.xgb.base.perc)
+  
+  ## Show results
+  df_pred_acc[6:out.row,]
+
+```
+
+<br>
+
+## 5.2 - Tuned XGBoost Model
+
+Next, we tune the XGBoost parameters. We use *(repeated) k-fold Cross validation* from the caret package to train the parameters.
+
+#### Train XGB Model
+
+```{r  eval=FALSE}
+
+  # applying grid search to find the best parameters
+  train_control <- trainControl(method="cv",
+                                number = 10)
+  
+  # fitControl <- trainControl(## 10-fold CV
+  #                            method = "repeatedcv",
+  #                            number = 10,
+  #                            ## repeated ten times
+  #                            repeats = 10)
+
+  xgb.train <- train(x = matrix_train[,-1],
+                     y = matrix_train[,1],
+                     trControl = train_control,
+                     method = "xgbTree")
+  
+```
+
+#### Tuned XGB Model
+
+We rerun the best tuned model to check the results.
+
+```{r eval=FALSE}
+
+  XGB_params_tuned <- list(#booster = "gbtree", 
+                            objective = "reg:linear", 
+                            eta=0.3, 
+                            base_score = 0.5,
+                            gamma= 0, 
+                            max_depth= xgb.train$bestTune$max_depth, 
+                            min_child_weight = xgb.train$bestTune$min_child_weight, 
+                            subsample = 1,
+                            colsample_bytree = xgb.train$bestTune$colsample_bytree,
+                            subsample = xgb.train$bestTune$subsample)
+                     
+
+  ## final tuned XGB model
+  xgb.tuned <- xgboost(data = xgb_train, 
+                       eval_metric = 'rmse',
+                       params = XGB_params_tuned,
+                       print_every_n = 20,
+                       nrounds = xgb.train$bestTune$nrounds)
+  
+  ## output IDs
+  out.row <- 13
+  out.name <- 'xgb.tuned'
+
+```
+
+#### Prediction Accuracy
+
+Last, we again add the prediction accuracy of this model to our dataframe.
+
+```{r eval=FALSE, include=FALSE}  
+  
+  ## Leave One Out Cross Validation (LOOCV)
+  for (k in 1:nrow(matrix_XL)) {
+ 
+    ## set data
+    loocv_train <- matrix_XL[-k, ] # every observation except k
+                   # make xgb matrix to train model
+                   loocv_train <- xgb.DMatrix(data = loocv_train[,-1], 
+                                              label = loocv_train[,1], 
+                                              missing = NA)
+    x_pred <- t(as.matrix(matrix_XL[k, -1])) # 'newdata' k (excluding dep var)
+    
+    ## regression Model
+    model.res <- xgboost(data = loocv_train, 
+                         eval_metric = 'rmse',
+                         params = XGB_params_tuned,
+                         print_every_n = 20,
+                         nrounds = xgb.train$bestTune$nrounds)
+
+    ## prediction results
+    model.pred <- predict(model.res, x_pred)
+    df_pred_LOOCV$xgb.tuned[k] <- exp(model.pred) # transform log back 
+
+  } # repeat k-times (for every object)
+    
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "xgb.tuned"
+  df_pred_acc$rmse_LOOCV[out.row] <- Metrics::rmse(df_pred_LOOCV$actual, df_pred_LOOCV$xgb.tuned)
+  df_pred_acc$mape_LOOCV[out.row] <- Metrics::mape(df_pred_LOOCV$actual, df_pred_LOOCV$xgb.tuned) * 100
+  
+```
+
+```{r eval=FALSE, include=FALSE}  
+
+  ## Simulation 2018 LOOCV
+  sim2018_train <- matrix_XL[matrix_XL[, "year_transaction.2018"] != 1,]
+  sim2018_test  <- matrix_XL[matrix_XL[, "year_transaction.2018"] == 1,]
+
+  ## adjust data where we assume that 2018 = 2017
+  sim2018_test[,'year_transaction.2018'] <- 0
+  
+  ## loop from begin 2018 to last observation
+  for (k in 1:nrow(sim2018_test)) {
+    
+    ## set subject object
+    xgb.sim2018_train <- xgb.DMatrix(data = sim2018_train[,-1], 
+                                     label = sim2018_train[,1], 
+                                     missing=NA)
+    x_pred <- t(as.matrix(sim2018_test[k, -1]))
+
+    ## regression Model
+    model.res <- xgboost(data = xgb.sim2018_train, 
+                         eval_metric = 'rmse',
+                         params = XGB_params_tuned,
+                         print_every_n = 20,
+                         nrounds = xgb.train$bestTune$nrounds)
+    
+    ## prediction results
+    model.pred <- predict(model.res, x_pred)
+    df_pred_2018$xgb.tuned[k] <- exp(model.pred)
+
+    ## add newdata to the training set
+    sim2018_train <- rbind(sim2018_train, sim2018_test[k,])
+
+  } # repeat k-times
+  
+  ## overall model accuracy
+  rownames(df_pred_acc)[out.row] <- "xgb.tuned"
+  df_pred_acc$rmse_2018[out.row] <- Metrics::rmse(df_pred_2018$actual, df_pred_2018$xgb.tuned)
+  df_pred_acc$mape_2018[out.row] <- Metrics::mape(df_pred_2018$actual, df_pred_2018$xgb.tuned) * 100
+  
+```
+
+```{r  eval=FALSE}
+
+  ## Out-of-sample
+  xgb.tuned.pred <- predict(xgb.tuned, xgb_test)
+  df_pred_out$xgb.tuned <- exp(xgb.tuned.pred)
+  df_pred_out$d.xgb.tuned <- df_pred_out$actual - df_pred_out$xgb.tuned
+  df_pred_out$d.xgb.tuned.perc <- df_pred_out$d.xgb.tuned / df_pred_out$actual * 100
+  df_pred_acc$rmse_out[out.row] <- Metrics::rmse(df_pred_out$actual, df_pred_out$xgb.tuned)
+  df_pred_acc$mape_out[out.row] <- Metrics::mape(df_pred_out$actual, df_pred_out$xgb.tuned) * 100
+    
+  ## In-sample
+  xgb.tuned.pred <- predict(xgb.tuned, xgb_train)
+  df_pred_in$xgb.tuned <- exp(xgb.tuned.pred)
+  df_pred_acc$rmse_in[out.row] <- Metrics::rmse(df_pred_in$actual, df_pred_in$xgb.tuned)
+  df_pred_acc$mape_in[out.row] <- Metrics::mape(df_pred_in$actual, df_pred_in$xgb.tuned) * 100
+    
+  ## LOOCV
+  df_pred_2018$d.xgb.tuned <- df_pred_2018$actual - df_pred_2018$xgb.tuned
+  df_pred_2018$d.xgb.tuned.perc <- df_pred_2018$d.xgb.tuned / df_pred_2018$actual * 100
+    
+  ## Sim 2018
+  df_pred_LOOCV$d.xgb.tuned <- df_pred_LOOCV$actual - df_pred_LOOCV$xgb.tuned
+  df_pred_LOOCV$d.xgb.tuned.perc <- df_pred_LOOCV$d.xgb.tuned / df_pred_LOOCV$actual * 100
+  
+  ## COD
+  df_pred_acc <- COD(out.row,out.name,df_pred_LOOCV$d.xgb.tuned.perc)
+  
+  ## Show results
+  df_pred_acc[6:out.row,]
+
+```
+
+#### Graph - Prediction Accuracy Distribution [XGB Tuned Model]
+
+```{r eval=FALSE} 
+
+  ## view output
+  ggplot(data=df_pred_out, aes(x=d.xgb.tuned.perc)) + theme_bw() +
+    geom_density(fill='#A4A4A4', alpha = 0.5) +
+    geom_density(data=df_pred_2018, aes(x=d.xgb.tuned.perc), size=1, linetype='dotdash') +
+    geom_vline(aes(xintercept=mean(d.xgb.tuned.perc)), colour="darkred", linetype="dashed", size=1) +
+    labs(title="Gradient Boosted Regression - Error Distribution (MAPE)", x ="", y = "") + xlim(c(-100,100))
+  
+```
+
+<br>
+
+## 5.3 - Variable importance
+
+Last, we check the variable importance from the Random Forest Model
+
+```{r  eval=FALSE}
+
+  ## get variable importance
+  XGB_imp <- xgb.importance(feature_names = dimnames(xgb_train)[[2]], model = xgb.base)
+  XGB_imp
+  
+  ## barplot
+  par(las=1) # make label text perpendicular to axis
+  par(mar=c(3,10,4,0)) # increase y-axis margin.
+  
+  barplot(XGB_imp$Gain[1:15], main="Grandient Boosting (Standard) - Variable Importance", horiz=TRUE, 
+          names.arg=c(XGB_imp$Feature[1:15]), cex.names=0.8, col='#357CA3', density=30)
+
+```
+
+Against the tuned model
+
+```{r  eval=FALSE}
+
+  ## get variable importance
+  XGB_imp <- xgb.importance(feature_names = dimnames(xgb_train)[[2]], model = xgb.tuned)
+  XGB_imp
+  
+  ## barplot
+  par(las=1) # make label text perpendicular to axis
+  par(mar=c(3,10,4,0)) # increase y-axis margin.
+  
+  barplot(XGB_imp$Gain[1:17], main="Grandient Boosting (Tuned) - Variable Importance", horiz=TRUE, 
+          names.arg=c(XGB_imp$Feature[1:17]), cex.names=0.8, col='#357CA3', density=30)
+
+```
+
+<br>
+
+---
+
+# 6. FINALIZE
+
+
+<br>
+
+To finish the *Data Modelling* phase by writing the predictions per model and per object back to the database.
+
+```{r eval=FALSE} 
+
+  ## write back to database
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+  try(sqlDrop(db.conn, "tbl5_predicted_values_loocv", errors = TRUE))
+  sqlSave(db.conn, df_pred_LOOCV, tablename = "tbl5_predicted_values_loocv", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+And clean workspace
+
+```{r eval=FALSE} 
+
+  try(odbcCloseAll())
+  remove(db.conn)
+  rm(list = ls())
+
+```
+<br>
+
+---
+
+> Go back to [top](#top)

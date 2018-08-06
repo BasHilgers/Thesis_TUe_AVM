@@ -1,0 +1,440 @@
+---
+title: 'API Requests'
+subtitle: "Thesis TUe - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1250px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+
+---
+
+# 1. BAG
+
+To get the information we just need an address (housenumber + postcode) and the necessary API Keys!
+
+<br>
+
+### 1.1 Longitude and Lattitude
+
+```{r eval=FALSE}  
+
+GET_verblijfsobject <- function(housenumber, postcode){
+  
+  # load libraries 
+  library(jsonlite)
+  library(bitops)
+  library(httr) # faster but no support content_type 'application/hal+json' 
+  library(RCurl) # slower but more data since also includes 'hal'
+
+  BAG_api_key = ""
+  
+  # output df format
+  OUTPUT_ll <- data.frame(housenumber = as.character(housenumber),
+                          postcode = as.character(postcode),
+                          lng = as.numeric(NA),
+                          lat = as.numeric(NA),
+                          link_pandrelatering = as.character(NA),
+                          link_openbareruimte = as.character(NA),
+                          stringsAsFactors = FALSE)
+  
+  
+  # loop through each input and append to output df
+  # ---------------------------------------------------------------------
+  for(i in 1:nrow(OUTPUT_ll)) {
+    
+    housenumber <- OUTPUT_ll$housenumber[i]
+    postcode <- OUTPUT_ll$postcode[i]
+    
+    if(!is.null(housenumber) || !is.null(postcode)) {
+      
+      # GET verblijfsobject ID
+      BAG_url = sprintf("https://bag.basisregistraties.overheid.nl/api/v1/nummeraanduidingen?postcode=%s&huisnummer=%s", postcode, housenumber)
+      require_1 <- GET(BAG_url, add_headers("x-api-key" = BAG_api_key))
+      BAG_data_verblijfsobject <- fromJSON(content(require_1, type="text", encoding="UTF-8"), simplifyVector = FALSE)
+  
+      if(length(BAG_data_verblijfsobject) != 0 && length(BAG_data_verblijfsobject$statusCode==400) == 0) { 
+      
+        # specify variables 1
+        OUTPUT_ll$link_openbareruimte[i] <- BAG_data_verblijfsobject[[1]][["_links"]][["bijbehorendeOpenbareRuimte"]][["href"]]
+        link_adresseerbaarObject <- BAG_data_verblijfsobject[[1]]$`_links`$adresseerbaarObject$href
+        
+        # try all addresses untill 'link_adresseerbaarObject' is found
+        attempt <- 2
+        while( length(link_adresseerbaarObject ) == 0) {
+          try(OUTPUT_ll$link_openbareruimte[i] <- BAG_data_verblijfsobject[[attempt]][["_links"]][["bijbehorendeOpenbareRuimte"]][["href"]])
+          try(link_adresseerbaarObject <- BAG_data_verblijfsobject[[attempt]]$`_links`$adresseerbaarObject$href)   
+          if(length(link_adresseerbaarObject ) == 0){ #alternative formulation
+            try(link_adresseerbaarObject <- BAG_data_verblijfsobject[[attempt]][["_links"]][["adresseerbaarObject"]][["href"]])
+          }
+          attempt <- attempt + 1
+          if (attempt == 25) break
+        }
+
+          if(length(link_adresseerbaarObject) != 0) {
+            
+            # GET info verblijfsobject + pand(link) + ll o.b.v. verblijfsobject(link)
+            require_2 <- getURL(link_adresseerbaarObject, httpheader = c(Accept = "application/hal+json", "x-api-key" = BAG_api_key))
+            BAG_data_pand <- fromJSON(require_2)    
+            
+            # specify variables 2
+            OUTPUT_ll$lng[i] <- BAG_data_pand$`_embedded`$geometrie$coordinates[1]
+            OUTPUT_ll$lat[i] <- BAG_data_pand$`_embedded`$geometrie$coordinates[2]
+            OUTPUT_ll$link_pandrelatering[i] <- BAG_data_pand$`_links`$pandrelateringen$href[1]
+            
+          }
+      }
+    }
+  }
+  
+  return(OUTPUT_ll)
+}
+  
+```
+
+<br>
+
+### 1.2 Streetname and City
+
+```{r eval=FALSE}  
+
+GET_public_space <- function(link_openbareruimte){
+  
+  # load libraries 
+  library(jsonlite)
+  library(httr) # faster but no support content_type 'application/hal+json' 
+  BAG_api_key = ""
+  
+  # output df format
+  OUTPUT_public_space <- data.frame(link_openbareruimte = as.character(link_openbareruimte),
+                                    street = as.character(NA),
+                                    city = as.character(NA),
+                                    stringsAsFactors = FALSE)
+  
+  
+  # loop through each input and append to output df
+  # ---------------------------------------------------------------------
+  for(i in 1:nrow(OUTPUT_public_space)) {
+  
+    if(!is.na(OUTPUT_public_space$link_openbareruimte[i])) {
+    link_openbareruimte = OUTPUT_public_space$link_openbareruimte[i]
+    
+    required <- getURL(link_openbareruimte, httpheader = c(Accept = "application/hal+json", "x-api-key" = BAG_api_key))
+    BAG_data_openbareruimte <- fromJSON(required)
+    
+    if(length(BAG_data_openbareruimte) != 0 && length(BAG_data_openbareruimte[["naam"]]==400) != 0) {  
+      
+        required_1 <- GET(BAG_data_openbareruimte[["_links"]][["bijbehorendeWoonplaats"]][["href"]], 
+                          add_headers("x-api-key" = BAG_api_key))
+        BAG_woonplaats <- fromJSON(content(required_1, type="text", encoding="UTF-8"))
+        
+        if(length(BAG_woonplaats) != 0) {
+          
+          # specify variables
+          OUTPUT_public_space$street[i] <- BAG_data_openbareruimte$naam
+          OUTPUT_public_space$city[i] <- BAG_woonplaats[["naam"]]
+        }
+    }
+    }
+  }
+  
+  return(OUTPUT_public_space)
+}
+  
+```
+
+<br>
+
+### 1.3 BAG ID and Construction Year
+
+```{r eval=FALSE}  
+
+GET_object_info <- function(link_pandrelatering){
+
+  # load libraries 
+  library(jsonlite)
+  library(httr) # faster but no support content_type 'application/hal+json' 
+  
+  BAG_api_key = ""
+  
+  # output df format
+  OUTPUT_BAG_object <- data.frame(link_pandrelatering = as.character(link_pandrelatering),
+                                  BAG_object_ID = as.numeric(NA),
+                                  construction_year = as.numeric(NA),
+                                  stringsAsFactors = FALSE)
+
+  
+  # loop through each input and append to output df
+  # ---------------------------------------------------------------------
+  for(i in 1:nrow(OUTPUT_BAG_object)) {
+    
+    if(!is.na(OUTPUT_BAG_object$link_pandrelatering[i])) {
+      
+    link_pandrelatering = OUTPUT_BAG_object$link_pandrelatering[i]
+    
+    # example: link_pandrelatering <- "https://bag.basisregistraties.overheid.nl/api/v1/panden/0363100012118868?geldigOp=2018-04-15"
+    required_1 <- GET(link_pandrelatering, add_headers("x-api-key" = BAG_api_key))
+    BAG_data_pand <- fromJSON(content(required_1, type="text", encoding="UTF-8"))
+    
+    if(length(BAG_data_pand) != 0 && length(BAG_data_pand$statusCode==400) == 0) {
+    
+      OUTPUT_BAG_object$BAG_object_ID[i] <- BAG_data_pand$identificatiecode
+      OUTPUT_BAG_object$construction_year[i] <- BAG_data_pand$oorspronkelijkBouwjaar[1]
+    }
+    }
+  }
+  
+  return(OUTPUT_BAG_object)
+}
+
+```
+
+<br>
+
+---
+
+# 2. WALKSCORE
+
+```{r eval=FALSE} 
+
+GET_walkscore <- function(housenumber, streetname, postcode, city, lat, lng){
+
+  # API key
+  walkscore_API_key <- ""
+   
+  #output df format
+  OUTPUT_walkscore <- data.frame(housenumber = housenumber,
+                                 streetname = streetname,
+                                 postcode = postcode,
+                                 city = city,
+                                 lat = as.numeric(lat),
+                                 lng = as.numeric(lng),
+                                 walkscore = NA,
+                                 walkscore_date = as.numeric(NA),
+                                 walkscore_link = NA,
+                                 stringsAsFactors = FALSE)
+  
+  
+  ## loop through each input and append results to output df
+  ## ------------------------------------------------------------------------------------
+  for(i in 1:nrow(OUTPUT_walkscore)){
+
+    # get string with adres seperated with necessary % character
+    streetname <- gsub(" ", "%", OUTPUT_walkscore$streetname[i], fixed=TRUE)
+    postcode <- gsub(" ", "%", OUTPUT_walkscore$postcode[i], fixed=TRUE)
+    city <- gsub(" ", "%", OUTPUT_walkscore$city[i], fixed=TRUE)
+    address = paste(OUTPUT_walkscore$housenumber[i], streetname, city, sep="%")
+    
+    # get raw data
+    walkscore_adres = sprintf("http://api.walkscore.com/score?format=json&address=%s&lat=%s&lon=%s&wsapikey=%s", 
+                              as.character(address), OUTPUT_walkscore$lat[i], OUTPUT_walkscore$lng[i], walkscore_API_key)
+    
+    # call api
+    raw_results = GET(walkscore_adres)
+    
+    ## try different format address
+    if(raw_results[["status_code"]] != 200) {
+      address = paste(OUTPUT_walkscore$housenumber[i], postcode, city, sep="%")
+      walkscore_adres = sprintf("http://api.walkscore.com/score?format=json&address=%s&lat=%s&lon=%s&wsapikey=%s", 
+                                as.character(address), OUTPUT_walkscore$lat[i], OUTPUT_walkscore$lng[i], walkscore_API_key)
+      raw_results = GET(walkscore_adres)
+    }
+
+    ## another try
+    if(raw_results[["status_code"]] != 200) {
+      address = paste(OUTPUT_walkscore$housenumber[i], postcode, sep="%")
+      walkscore_adres = sprintf("http://api.walkscore.com/score?format=json&address=%s&lat=%s&lon=%s&wsapikey=%s", 
+                                as.character(address), OUTPUT_walkscore$lat[i], OUTPUT_walkscore$lng[i], walkscore_API_key)
+      raw_results = GET(walkscore_adres)
+    }
+    
+    ## last try
+    if(raw_results[["status_code"]] != 200){
+      
+      address = paste(OUTPUT_walkscore$housenumber[i], OUTPUT_walkscore$postcode[i], city, sep="%")
+      walkscore_adres = sprintf("http://api.walkscore.com/score?format=json&address=%s&lat=%s&lon=%s&wsapikey=%s", 
+                                as.character(address), OUTPUT_walkscore$lat[i], OUTPUT_walkscore$lng[i], walkscore_API_key)
+      raw_results = GET(walkscore_adres)
+      
+    }
+    
+    if (raw_results[["status_code"]] == 200){
+      
+      # Convert json data to readable data
+      walkscore_data <- fromJSON(content(raw_results, type="text", encoding="UTF-8"))
+      
+      if(!is.na(walkscore_data[["walkscore"]][1])){
+      # store results
+      OUTPUT_walkscore$walkscore[i] <- walkscore_data[["walkscore"]][1]
+      OUTPUT_walkscore$walkscore_date[i] <- walkscore_data[["updated"]][1]
+      OUTPUT_walkscore$walkscore_link[i] <- walkscore_data[["ws_link"]][1]
+      }
+    }
+  }
+
+  return(OUTPUT_walkscore)
+}
+
+```
+
+<br>
+
+---
+
+# 2. GOOGLE
+
+<br>
+
+### 2.1 Distance and Duration
+
+```{r eval=FALSE} 
+
+GET_google_distances_duration <- function(lat_object, lng_object, lat_place, lng_place, mode){
+
+  # libraries
+  library(httr)
+  library(jsonlite)
+  
+  # API keys
+  google_api_key = ""
+  
+  # output df format
+  OUTPUT_google_duration <- data.frame(lat_object = lat_object,
+                                       lng_object = lng_object,
+                                       lat_place = lat_place,
+                                       lng_place = lng_place,
+                                       distance = as.numeric(NA),
+                                       duration = as.numeric(NA),
+                                       stringsAsFactors = FALSE)
+  
+  
+  ## loop through each input and append results to output df
+  ## ------------------------------------------------------------------------------------
+  
+  for(i in 1:nrow(OUTPUT_google_duration)) {
+
+    if(!is.na(OUTPUT_google_duration$lat_object[i]) && !is.na(OUTPUT_google_duration$lat_place[i])) {
+    
+    # url
+    google_url <- sprintf('https://maps.googleapis.com/maps/api/distancematrix/json?units=metric&origins=%s,%s&destinations=%s,%s&mode=%s&key=%s', 
+                          OUTPUT_google_duration$lat_object[i], OUTPUT_google_duration$lng_object[i],
+                          OUTPUT_google_duration$lat_place[i], OUTPUT_google_duration$lng_place[i], 
+                          mode, google_api_key)
+    
+    # call API
+    raw_results <- GET(url = google_url)
+    
+    # Convert json data to readable data
+    raw_content <- rawToChar(raw_results$content)
+    RAW_JSON <- fromJSON(raw_content)
+    
+    
+    # check request validity and store results in output df
+    if (RAW_JSON$status == "OK"){
+      
+      try( OUTPUT_google_duration$distance[i] <- RAW_JSON$rows$elements[[1]]$distance$value )
+      try( OUTPUT_google_duration$duration[i] <- RAW_JSON$rows$elements[[1]]$duration$value/60 )
+      
+    } else { 
+      
+      OUTPUT_google_duration$distance[i] <- RAW_JSON$status
+      
+      # Try different keys if limit is reached
+      if ( RAW_JSON$status == "OVER_QUERY_LIMIT") {
+      google_api_key <- "" 
+      i = i - 1
+      }
+    }
+    }
+  }
+     
+  return(OUTPUT_google_duration)
+}
+
+```
+
+<br>
+
+### 2.2 Places
+
+```{r eval=FALSE} 
+
+GET_google_places <- function(lat, lng, places_type){
+
+  # libraries
+  library(httr)
+  library(jsonlite)
+
+  # API key
+  google_api_key <- "" 
+ 
+  
+  # output df format
+  OUTPUT_google_places <- data.frame(lat_IN = as.numeric(lat),
+                                     lng_IN = as.numeric(lng),
+                                     name = as.character(NA),
+                                     type = as.character(NA),
+                                     X_lat = as.numeric(NA),
+                                     X_lng = as.numeric(NA),
+                                     stringsAsFactors = FALSE)
+  
+  
+  ## loop through each input and append results to output df
+  ## ------------------------------------------------------------------------------------
+  for(i in 1:nrow(OUTPUT_google_places)) {
+   
+    # url
+    google_url <- sprintf('https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=%s,%s&rankby=distance&type=%s&key=%s', 
+                          OUTPUT_google_places$lat_IN[i], OUTPUT_google_places$lng_IN[i], places_type, google_api_key)
+  
+    # call API
+    raw_results <- GET(url = google_url)
+  
+    # convert to JSON
+    converted_raw_results <- rawToChar(raw_results$content)
+    RAW_JSON <- fromJSON(converted_raw_results)
+    
+    # check request validity and store results in output df
+    if (RAW_JSON$status == "OK"){
+      
+      OUTPUT_google_places$name[i] <- RAW_JSON$results$name[1]
+      OUTPUT_google_places$type[i] <- places_type
+      OUTPUT_google_places$X_lat[i] <- RAW_JSON$results$geometry$location$lat[1]
+      OUTPUT_google_places$X_lng[i] <- RAW_JSON$results$geometry$location$lng[1]
+      
+    } else { 
+
+      OUTPUT_google_places$name[i] <- RAW_JSON$status
+      
+      # try different keys if limit is reached
+      if ( RAW_JSON$status == "OVER_QUERY_LIMIT") {
+        google_api_key <- "" 
+        google_api_key <- ""
+        i = i - 1
+      }
+
+    }
+
+  }
+  return(OUTPUT_google_places)
+}
+
+```
+
+<br>
+
+---
+
+> Go back to [top](#top)

@@ -1,0 +1,822 @@
+---
+title: "PHASE 3: DATA PREPARATION"
+subtitle: "Thesis TU/e - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+
+---
+
+# 1. INTRODUCTION
+
+<br>
+
+In the third phase we discuss the *data preparation* process. In it we cover the following actions:
+
+  - data transformations
+  - data integrations
+  - data filters
+
+We begin with a set of preliminary commands. Specifically, we load the necessary libraries, set our directory paths, turn of scientific formatting.
+
+```{r set-options, message=FALSE, warning=FALSE}
+
+  ## load Libraries
+  library(knitr)      # publication options markdown
+  library(tidyverse)  # tidyverse toolkit (dyplr)
+  library(RODBC)      # database connection
+
+  ## Set data and code directory
+  wd.dir   <- file.path('C:/Users/bashi/Desktop/TUe Thesis')
+  data.dir <- file.path(wd.dir, '5 Data', 'AVM database')
+  code.dir <- file.path(wd.dir, '6 Modelling', 'modules')
+
+  ## load custom Functions
+  source(paste0(code.dir, '/custom_functions_data_preparation.R'))
+  
+  ## file options
+  options(width=120) # control width output
+  knitr::opts_chunk$set(out.width='800px', dpi=200) # control width figures
+  options(scipen=999)
+  options(stringsAsFactors = FALSE)
+  
+```
+
+We then set the path to our active database and establish a connection to it. 
+
+```{r}  
+
+  ## get raw data from database
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+  df_XL <- sqlFetch(db.conn, "tbl2_data_managed_AVM")
+
+```
+
+Eyeball the raw data we are working with.
+
+```{r eval=FALSE}  
+
+  ## variables + types
+  str(df_XL, list.len=ncol(df_XL))
+
+```
+
+We also look at the number of missing variables per variable.
+
+```{r}  
+
+  ## table missing values
+  missing_values <- sapply(df_XL, function(y) sum(length(which(is.na(y)))))
+  missing_values <- data.frame(missing_values, perc = missing_values/nrow(df_XL)*100)
+  missing_values <- missing_values[order(missing_values$perc),]
+  missing_values
+
+  ## plot missing values
+  missing_values <- df_XL %>% summarize_all(funs(sum(is.na(.))/n()))
+  missing_values <- gather(missing_values, key="feature", value="missing_pct")
+  missing_values[75:nrow(missing_values),] %>% 
+    ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+    geom_bar(stat="identity",fill="steelblue")+
+    coord_flip()+theme_bw()
+  
+```
+
+<br>
+
+---
+
+# 2. TRANSACTION RELATED DATA 
+
+<br>
+
+First we subset the data to only include reliable / complete observations.
+
+```{r}  
+
+  ## exclude missing IDs
+  df_XL <- dplyr::filter(df_XL, BOG_ID > 0)
+  print(paste0("Total number of observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Transactions
+
+Next we prepare variables closely relarted to our dependent variable that are mandatory. These are: 
+
+- Net transaction price (< 100 EUR are usually as non arm's length transactions and are excluded)
+- Transaction date (year / quarter)
+- Geocoordinates
+
+```{r}
+
+  ## Filter out those with missing transaction prices or unreasonable numbers
+  df_XL <- dplyr::filter(df_XL, purchase_price_net > 100)
+  df_XL <- dplyr::filter(df_XL, purchase_price_net < 100000000)
+  df_XL <- dplyr::filter(df_XL, TRI_per_sqm >= 30)
+  
+  # Transaction date to obtain transaction year and quarter
+  df_XL$year_transaction <- as.numeric(format(as.Date(df_XL$transfer_date, format="%d/%m/%Y"),"%Y"))
+  df_XL$month_transaction <- as.numeric(format(as.Date(df_XL$transfer_date, format="%d/%m/%Y"),"%m"))
+  df_XL$half_transaction <- ((df_XL$month_transaction - 1) %/% 6) + 1
+  df_XL$halfyear_transaction <- paste(df_XL$year_transaction, df_XL$half_transaction, sep = ".")
+  df_XL$qtr_transaction <- ((df_XL$month_transaction - 1) %/% 3) + 1
+  df_XL$yq_transaction <- paste(df_XL$year_transaction, df_XL$qtr_transaction, sep = ".")
+      
+  ## Geocoordinate
+  df_XL <- dplyr::filter(df_XL, housenumber > 0)
+  df_XL <- dplyr::filter(df_XL, postcode > 0)
+  df_XL <- dplyr::filter(df_XL, longitude > 0)
+  df_XL <- dplyr::filter(df_XL, latitude > 0)
+  
+  ## Output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Subset Period
+
+The turbulent period around the economic crisis of 2008-2009 is excluded from the analysis.
+
+```{r warning=FALSE}  
+
+  ## limit timespan of transactions
+  df_XL <- dplyr::filter(df_XL,  year_transaction > 2009)
+
+  ## distribution transaction dates (year)
+  # df_XL %>% rowwise() %>%
+  #   group_by(year_transaction) %>%
+  #   dplyr::summarise(no_of_transactions = length(year_transaction))
+  
+  ## distribution transaction dates (halfyear)
+  df_XL %>% rowwise() %>%
+    group_by(halfyear_transaction) %>%
+    dplyr::summarise(no_of_transactions = length(halfyear_transaction))
+  
+  ## Output
+  print(paste0("Total observations: ", nrow(df_XL)))
+  
+```
+
+<br>
+
+#### Temporary savepoint
+
+```{r eval=FALSE}  
+
+  tail(df_XL)
+  try(sqlDrop(db.conn, "tbl3_data_prepared", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl3_data_prepared", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+<br>
+
+---
+
+# 3. BUILDING FACTORS
+
+<br>
+
+We perform a number of preparation exercises on the building data. Variables obtained are as follows:
+
+- Building Age
+- Building size
+- Parking spots
+- Building height
+- Energy label
+
+<br>
+
+#### Building age
+
+We start with the building age. The age of a property (proxy for quality) is represented in three different ways:
+
+- dummy periods
+- year construction / last renovation
+- effective age
+
+```{r warning=FALSE}
+
+  ## cap minimum year of construction
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(year_of_construction = 
+                         ifelse(year_of_construction < 1900, 1900, year_of_construction))
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(year_last_renovation = 
+                         ifelse(year_last_renovation < 1900, 1900, year_last_renovation))
+
+  ## Year built or renovation
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(year_built_or_renov = 
+                         ifelse(year_last_renovation > 0 && !is.na(year_last_renovation), 
+                                year_last_renovation, 
+                                year_of_construction))
+
+
+  ## calculate age
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(age = year_transaction - year_of_construction)
+
+  ## calculate effective age 
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(effective_age = year_transaction - year_built_or_renov)
+                         
+  ## Max effective age of 0
+  df_XL <- df_XL %>%
+           dplyr::mutate(effective_age = max(0, effective_age))
+  df_XL <- df_XL %>%
+           dplyr::mutate(age = max(0, age))
+   
+  ## building periods (like funda business)
+  df_XL <- df_XL %>%
+           dplyr::mutate(building_period = 
+                    ifelse(year_of_construction < 1906, "before_1906",
+                    ifelse(year_of_construction >= 1906 && year_of_construction < 1931, "1906-1930",
+                    ifelse(year_of_construction >= 1931 && year_of_construction < 1945, "1931-1944",
+                    ifelse(year_of_construction >= 1945 && year_of_construction < 1960, "1945-1959",
+                    ifelse(year_of_construction >= 1960 && year_of_construction < 1971, "1960-1970",
+                    ifelse(year_of_construction >= 1971 && year_of_construction < 1981, "1971-1980",
+                    ifelse(year_of_construction >= 1981 && year_of_construction < 1991, "1981-1990",
+                    ifelse(year_of_construction >= 1991 && year_of_construction < 2001, "1991-2000",
+                    ifelse(year_of_construction >= 2001 && year_of_construction <= 2010, "2001-2010",
+                    ifelse(year_of_construction > 2010, "after_2010",NA)))))))))))
+  
+  ## building periods that take into account year last renovation
+  df_XL <- df_XL %>%
+           dplyr::mutate(building_period_renov = 
+                    ifelse(year_built_or_renov < 1906, "before_1906",
+                    ifelse(year_built_or_renov >= 1906 && year_built_or_renov < 1931, "1906-1930",
+                    ifelse(year_built_or_renov >= 1931 && year_built_or_renov < 1945, "1931-1944",
+                    ifelse(year_built_or_renov >= 1945 && year_built_or_renov < 1960, "1945-1959",
+                    ifelse(year_built_or_renov >= 1960 && year_built_or_renov < 1971, "1960-1970",
+                    ifelse(year_built_or_renov >= 1971 && year_built_or_renov < 1981, "1971-1980",
+                    ifelse(year_built_or_renov >= 1981 && year_built_or_renov < 1991, "1981-1990",
+                    ifelse(year_built_or_renov >= 1991 && year_built_or_renov < 2001, "1991-2000",
+                    ifelse(year_built_or_renov >= 2001 && year_built_or_renov <= 2010, "2001-2010",
+                    ifelse(year_built_or_renov > 2010, "after_2010",NA)))))))))))
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Floor size (LFA)
+
+```{r warning=FALSE}
+
+  ## show observations unlikely floor size
+  df_XL <- dplyr::filter(df_XL, !is.na(total_LFA) && total_LFA > 10)
+
+  # ## total LFA cannot be zero
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(total_LFA = ifelse(total_LFA < 10, NA, total_LFA))
+  
+  ## we can now also determine price of the property per m2
+  df_XL <- df_XL %>%  rowwise() %>%
+           dplyr::mutate(price_per_sqm = purchase_price_net/total_LFA)
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Parking spots
+
+If ERV per parking as input, then cannot be zero.
+
+```{r warning=FALSE}
+
+  ## assumption replace parking NA by 0
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(parking_spots = ifelse(is.na(parking_spots), 0, parking_spots)) 
+  
+  ## manually check when there is ERV but no parking
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```      
+
+<br>
+
+#### Building height
+
+Missing building heights are filled based on counting floors on images. Remainder median substituted.
+
+```{r warning=FALSE}
+
+  ## make building heights NA if below 3m
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(building_height = ifelse(building_height < 3 , NA, building_height))
+  
+  ## If missing mean substitude
+  df_XL <- df_XL %>% dplyr::group_by(wijk) %>%
+           dplyr::mutate(building_height = ifelse(is.na(building_height), 
+                                                  median(building_height, na.rm=T), 
+                                                  building_height))
+  
+      ## if wijk not available use municipality
+      df_XL <- df_XL %>% dplyr::group_by(gemeente) %>%
+               dplyr::mutate(building_height = ifelse(is.na(building_height), 
+                                                      median(building_height, na.rm=T), 
+                                                      building_height))
+      
+      ## if municipality not available use corop
+      df_XL <- df_XL %>% dplyr::group_by(COROP_region) %>%
+               dplyr::mutate(building_height = ifelse(is.na(building_height), 
+                                                      median(building_height, na.rm=T), 
+                                                      building_height))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+  
+```
+
+<br>
+
+#### Energy label
+
+Missing values median substituted based on groupings of same building period (or last renovated if applicable)
+
+```{r warning=FALSE}
+
+  ## simple mean sustitute
+  df_XL <- df_XL %>% dplyr::group_by(building_period_renov) %>%  
+           dplyr::mutate(EP_energieklasse = ifelse(is.na(EP_energieklasse), 
+                         names(table(EP_energieklasse))[which.max(table(EP_energieklasse))],
+                         EP_energieklasse))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+  
+```
+
+<br>
+
+#### Temporary savepoint
+
+```{r eval=FALSE}  
+
+  tail(df_XL)
+  try(sqlDrop(db.conn, "tbl3_data_prepared", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl3_data_prepared", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+<br>
+
+---
+
+# 4. LEASE FACTORS
+
+<br>
+
+We perform a number of preparation exercises on the Lease data. Variables obtained are as follows:
+
+- Vacancy percentage
+- Rents
+- Lease Terms
+- Other
+
+<br>
+
+#### Vacancy percentage
+
+Vacancy percentage based in m2 vacant area and let.
+
+```{r warning=FALSE}
+
+  # ## assume let m2 null = 0
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(let_LFA = ifelse(is.null(let_LFA), 0, let_LFA))  
+  # 
+  # ## assume vacancy m2 null = 0
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(vacant_LFA = ifelse(is.null(vacant_LFA), 0, vacant_LFA)) 
+  # 
+  # ## estimate vacancy based on total LFA + vacant
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(vacancy_perc = vacant_LFA / total_LFA)
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Rents
+
+Four types rents are determined
+
+- ERV parking
+- Rental income (RI)
+- Estimated Rental Value (ERV)
+- Theoretical Rental Income (THI)
+- Estimated Rental Value Vacancy 
+
+*Rental Income*
+
+```{r warning=FALSE}
+
+  #   ## if vacancy not 100%, then likely that RI is zero. Check input manually
+  #   df_XL %>% dplyr::filter(RI_total > 0 && let_LFA == 0)
+  #   df_XL <- df_XL %>% rowwise() %>%
+  #            dplyr::mutate(RI_per_sqm = ifelse(RI_total == 0, 0,
+  #                                       ifelse(RI_total > 0 && let_LFA != 0, 
+  #                                              RI_total/let_LFA, 
+  #                                              NA)))
+  # 
+  #   ## RI per sqm equals RI total / let area
+  #   df_XL <- df_XL %>% rowwise() %>%
+  #            dplyr::mutate(RI_per_sqm = ifelse(RI_total == 0, 0,
+  #                                       ifelse(RI_total > 0 && let_LFA != 0, 
+  #                                              RI_total/let_LFA, 
+  #                                              NA)))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+*Estimated Rental Value*
+
+The ERV is not complete and is excluded from the analysis (for now)
+
+```{r warning=FALSE}
+
+  ## if ERV is 0 then missing
+  # df_XL %>% dplyr::filter(ERV_total == 0)
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(ERV_total = ifelse(ERV_total == 0 , NA, ERV_total))
+
+  ## ERV per sqm = ERV total / let area (excl parking)
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(ERV_per_sqm = ifelse(ERV_total > 0, ERV_total/total_LFA, NA))
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+*Estimated Rental Value Vacancy*
+
+Note to self: ERV vacancy does not have to equal m2 vacancy * ERV per m2
+
+```{r warning=FALSE}
+
+  # ## if filled in negative make positive
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_vacancy = abs(ERV_vacancy))
+  # 
+  # ## if vacancy is 0% then no ERV and if na then na
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_vacancy = ifelse(is.na(vacancy_perc), NA, 
+  #                                      ifelse(vacancy_perc == 0, 0,
+  #                                             ERV_vacancy)))
+  # 
+  # ## if vacancy but no ERV vacancy fill with m2 vacancy * ERV per m2                        
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_vacancy = 
+  #                        ifelse(is.na(ERV_vacancy), vacant_LFA * ERV_per_sqm, 
+  #                        ifelse(vacant_LFA > 0 && ERV_vacancy == 0 && ERV_per_sqm > 0, 
+  #                               ERV_per_sqm * vacant_LFA,
+  #                               ERV_vacancy)))
+  # 
+  # ## ERV vacancy per m2 
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_per_sqm_vacancy = ifelse(ERV_vacancy > 0, ERV_total/vacant_LFA, 
+  #                                              ifelse(ERV_vacancy == 0, 0, NA)))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+
+```
+
+*Theoretical Rental Income*
+
+```{r warning=FALSE}
+  
+  # ## CALC: TRI = RI + ERV vacancy if NA
+  # df_XL %>% dplyr::filter(TRI_total == 0)
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(TRI_total = RI_total + ERV_vacancy)
+  # 
+  # ## CALC: TRI per sqm = TRI total / total LFA (excl parking)
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(TRI_per_sqm = TRI_total/total_LFA)
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+*Estimated Rental Value parking*
+
+```{r warning=FALSE}
+
+  # ## ERV per parking
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_per_parking = ifelse(parking_spots==0, 0, ERV_per_parking))
+  # 
+  # ## ERV total parking formula
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_parking = parking_spots * ERV_per_parking)
+  # 
+  # ## RI per sqm equals RI total / let area (excl. parking)
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(RI_per_sqm_excl_parking = ifelse(let_LFA > 0,
+  #                                                         sum(RI_total, -ERV_parking, na.rm=T)/let_LFA,
+  #                                                         RI_per_sqm))
+  # 
+  # ## ERV per sqm equals ERV total / total area (excl. parking)
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(ERV_per_sqm_excl_parking = ifelse(ERV_total > 0,
+  #                                                          sum(ERV_total, -ERV_parking, na.rm=T)/total_LFA,
+  #                                                          ERV_per_sqm))
+  # 
+  # ## THI per sqm equals TRI total / total area (excl. parking)
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(TRI_per_sqm_excl_parking = ifelse(TRI_total > 0,
+  #                                                          sum(TRI_total, -ERV_parking, na.rm=T)/total_LFA,
+  #                                                          TRI_per_sqm))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+  
+```
+
+<br>
+
+#### Lease Terms
+
+```{r warning=FALSE}
+
+  # ## if 100% vacancy then WALE = 0
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(WALE_incl_vacancy = ifelse(is.na(WALE_incl_vacancy) && let_LFA == 0, 
+  #                                                   0, WALE_incl_vacancy)) %>%
+  #          dplyr::mutate(WALE_excl_vacancy = ifelse(is.na(WALE_excl_vacancy) && let_LFA == 0, 
+  #                                                   0, WALE_excl_vacancy))
+  # 
+  # ## WALE incl
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(WALE_incl_vacancy = ifelse(is.na(WALE_incl_vacancy) && TRI_total != 0, 
+  #                                                   (WALE_excl_vacancy * RI_total) / TRI_total,
+  #                                                   WALE_incl_vacancy))
+  # 
+  # ## WALE excl
+  # df_XL <- df_XL %>% rowwise() %>%
+  #          dplyr::mutate(WALE_excl_vacancy = ifelse(is.na(WALE_excl_vacancy) && RI_total != 0, 
+  #                                                   (WALE_incl_vacancy * TRI_total) / RI_total,
+  #                                                   WALE_excl_vacancy))
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Rental Difference
+
+```{r warning=FALSE}
+
+  ## if no RI then WALE = 0 (use TRI??)
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(PV_rental_diff = ifelse(ERV_total > 0 && WALE_excl_vacancy > 0,
+                                                (ERV_total - RI_total) * (1 + 0.06) ^ -WALE_excl_vacancy,
+                                          ifelse(WALE_excl_vacancy == 0, 0, NA)))
+
+  ## if no RI then WALE = 0
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(underrented = ifelse (PV_rental_diff > 0, "UNDER",
+                                       ifelse (PV_rental_diff > -1000 && PV_rental_diff < 1000, 
+                                               "MARKET", "OVER" )))
+    
+  ## eyeball missing values
+  # df_XL %>% dplyr::filter(is.na(PV_rental_diff))
+  # df_XL %>% dplyr::filter(is.na(underrented))
+  
+  ## if missing assume market and add id (TO DO)
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(error_id = ifelse(is.na(underrented), 1, 0)) %>%
+           dplyr::mutate(error_var = ifelse(is.na(underrented), "underrented", NA)) %>%
+           dplyr::mutate(underrented = ifelse(is.na(underrented), "MARKET", underrented))
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Temporary savepoint
+
+```{r eval=FALSE}  
+
+  tail(df_XL)
+  try(sqlDrop(db.conn, "tbl3_data_prepared", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl3_data_prepared", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+<br>
+
+---
+
+# 5. LOCATION FACTORS
+
+<br>
+
+Location factors covered are
+
+- Accessibility
+- Ammenities (walkscore)
+- Liveability (Leefbaarometer)
+- Other
+
+<br>
+
+#### Accessibility
+
+The different types of accessibility covered are:
+
+- nearest station (min walking)
+- highway access (min driving)
+
+```{r warning=FALSE}
+
+  # ## TEMP - done in management
+  # df_XL <- df_XL %>% rowwise %>%
+  #          dplyr::mutate(train_station_duration = ifelse(train_station_name %in% "ZERO_RESULTS", 
+  #                                                        99, train_station_duration))  %>%
+  #          dplyr::mutate(train_station_distance = ifelse(train_station_name %in% "ZERO_RESULTS", 
+  #                                                        9999, train_station_distance))  %>%
+  #          dplyr::mutate(train_station_intercity = ifelse(train_station_name %in% "ZERO_RESULTS", 
+  #                                                         FALSE, train_station_intercity)) 
+  
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Ammenities
+
+Ammenities are measured by Walkscore
+
+```{r warning=FALSE}
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Liveability
+
+Liveability is measured through the leefbaarometer
+
+```{r warning=FALSE}
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+#### Other
+
+- city category
+- centrality
+- type of district
+
+
+```{r warning=FALSE}
+
+  ## output
+  print(paste0("Total observations: ", nrow(df_XL)))
+
+```
+
+<br>
+
+```{r eval=FALSE}  
+
+  tail(df_XL)
+  try(sqlDrop(db.conn, "tbl3_data_prepared", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl3_data_prepared", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+  
+```
+
+<br>
+
+---
+
+# 6. FINALIZE DATA / WRITE TO DATABASE
+
+<br>
+
+Finally, we remove all of the unnecessary field and rename some variables.
+
+```{r eval=FALSE}  
+
+  # Transform:  Limit field names
+  df_XL <- dplyr::select(.data=df_XL,
+
+       ## TRANSACTION INFO
+          BOG_ID,                 # unique ID to link back to database
+          purchase_price = purchase_price_net,     # dependent variable
+          transfer_date,          # transaction date (finest granularity)
+          year_transaction,       # transaction year (wide granularity)
+          halfyear_transaction,   # transaction halfyear
+          latitude,               # lattitude
+          longitude,              # longitude
+       ## BUILDING FACTORS
+          year_built =  year_of_construction, # year built
+          year_built_or_renov,    # year built or last renovated
+          age,                    # Age
+          effective_age,          # years between transaction and last renovation
+          building_period,        # year built
+          building_period_renov,  # distinct buiding periods
+          total_LFA,              # building size
+          building_height,        # building height
+          EP_energieklasse,       # energy performance (green building)
+          parking_spots,          # number of parking spots (inside and/or outside)
+       ## LOCATION FACTORS
+          COROP_region,           # often used for statistical research
+          city_category,          # large or small city
+          centrality,             # walking distance of intercity station
+          CW_district_type,       # indicator: kantoorgebied, bedrijfsgebied, gemengd, other.
+          walkscore,              # score for ammenities with walkscore api
+          train_station_duration, # min walking to nearest station
+          highway_access_duration,# min driving to nearest highway access
+          lbm_total_score,        # leefbaarometer (later split up)
+       ## LEASE FACTORS
+          vacancy = vacancy_perc, # amount of LFA vacant at time of sale (as percent of total LFA)
+          TRI_per_sqm,            # total theoretical rental income (includes value for vacancy)
+          WALE = WALE_incl_vacancy,      # remaining lease term including vacancy m2
+          underrented             # rental income above or under market rent
+                                  )
+
+```
+
+We then write the data back to the database as *tbl3_data_prepared*.
+
+```{r eval=FALSE} 
+
+  ## write back to database
+  try(sqlDrop(db.conn, "tbl3_data_prepared", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl3_data_prepared", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+We finish the *Data Preperation* phase of our analysis by closing the connection to the database. 
+
+```{r eval=FALSE}  
+
+  ## close db connection
+  odbcCloseAll()
+  remove(db.conn)
+  rm(list = ls())
+
+```
+
+<br>
+
+---
+
+> Go back to [top](#top)

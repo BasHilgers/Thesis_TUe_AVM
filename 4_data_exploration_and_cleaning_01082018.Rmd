@@ -1,0 +1,1168 @@
+---
+title: 'PHASE 4: DATA EXPLORATION AND CLEANING'
+subtitle: "Thesis TU/e - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+editor_options:
+  chunk_output_type: inline
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+
+---
+
+# 1. INTRODUCTION
+
+<br>
+
+Phase 4 covers the **Data Exploration** and **Data Cleaning** steps. As these phases are highly iterative, and often rely on similar techniques and methods, we will cover them jointly in the code below. The steps taken are:
+
+- summary statistics
+- correlations
+- univariate analysis
+- multivariate analysis
+
+<br>
+
+As usual, we begin with a set of preliminary commands.
+
+```{r set-options, message=FALSE, warning=FALSE}  
+
+  ## Load Libraries
+  library(knitr)      # publication options markdown
+  library(sf)         # Spatial vectors
+  library(sp)         # Spatial points
+  library(tidyverse)  # Tidyverse toolkit (dyplr)
+  library(RODBC)      # Database connection
+  library(geosphere)  # Geographic analyis
+  library(rgeos)      # Geographic analysis
+  library(grid)       # plots in grid form
+  library(corrplot)   # correlation plots
+  library(GGally)     # Bar plots
+  library(car)        # Regression tools
+  library(rgdal)      # Spatial analysis
+  library(e1071)      # Kurtosis , skewness
+  library(scales)     # Notation / formats
+  library(leaflet)    # Mapping
+  library(ggplot2)    # Plots
+
+  ## Set data and code directory
+  wd.dir   <- file.path('C:/Users/bashi/Desktop/TUe Thesis')
+  data.dir <- file.path(wd.dir, '5 Data', 'AVM database')
+  geo.dir  <- file.path(wd.dir, '5 Data', 'polygons')
+  code.dir <- file.path(wd.dir, '6 Modelling', 'modules')
+  
+  ## Load custom source files
+  source(paste0(code.dir, '/custom_functions_data_exploration.R'))
+  
+  ## file options
+  options(width=120) # control width output
+  knitr::opts_chunk$set(out.width='800px', dpi=200) # control width figures
+  knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+  options(scipen=999)
+  options(stringsAsFactors = TRUE)
+  options(digits = 2)
+  
+```
+
+And then we set the name of the database and establish a connection to it.
+
+```{r}  
+
+  ## Establish connection
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+  df_XL <- sqlFetch(db.conn, "tbl3_data_prepared")
+  
+  ## convert dates
+  df_XL <- dplyr::mutate(df_XL, transfer_date = as.Date(transfer_date, format="%d/%m/%Y"))
+  df_XL$year_transaction <- as.factor(df_XL$year_transaction)
+  df_XL$halfyear_transaction <- as.factor(df_XL$halfyear_transaction)
+
+```
+
+<br>
+
+#### Eyeball Data
+
+In the Data Preperation Phase all missing values should have been removed. We check if this is indeed the case.
+
+```{r}
+
+  #df_XL[!complete.cases(df_XL), ]
+  df_XL <- df_XL[complete.cases(df_XL),]
+
+```
+
+
+```{r}  
+
+  str(df_XL, list.len=ncol(df_XL))
+
+```
+
+<br>
+
+---
+
+# 2. SUMMAMRY STATISTICS
+
+<br>
+
+We start with exploring the univariate properties of the transaction data.
+
+First, we get a list of the field types (i.e. numeric or categorical).
+Note: cannot handle Field.types
+
+```{r}  
+
+  field.types <- unlist(lapply(df_XL, class))
+
+```
+
+<br>
+
+#### Summary Statistics
+
+For all fields that are **numeric or integers**, we build a summary statistics table using the *fullSummary* custom function. We then print this to the screen for review. 
+
+```{r}  
+
+  ## Compute summary table for numeric and integer variables
+  summ.table <- t(do.call(cbind, 
+                        lapply(df_XL[,field.types == 'numeric' |
+                                      field.types == 'integer'],
+                               fullSummary)))
+  
+  ## Show the table
+  summ.table
+  
+```
+
+Next, we compute a set of summary statistic for the **factor (categorical) variables**. We view the levels.
+
+```{r}  
+
+  #summary(df_XL[, field.types == 'factor'])
+  sapply(df_XL[, field.types == 'factor'], levels)
+
+```
+
+<br>
+
+#### Data transformations
+
+From the exploration above, we make a number **transformations** to the data.
+
+We convert the energy label and building height due to the small number of observations in some levels.
+
+```{r} 
+
+  ## recode energylabels
+  df_XL$EP_energieklasse <- recode(df_XL$EP_energieklasse, "c('A+', 'A++','A+++') = 'Above_A' ;
+                                                            c('G', 'F', 'E', 'D') = 'below_C'")
+  
+  ## recode building years
+  df_XL$building_period_renov <- recode(df_XL$building_period_renov, 
+                                        "c('1906-1930', '1931-1944') = '1906-1944' ;
+                                         c('1945-1959', '1960-1970') = '1945-1970' ;
+                                         c('1971-1980', '1981-1990') = '1971-1990' ")
+  df_XL$building_period <- recode(df_XL$building_period, 
+                                        "c('1906-1930', '1931-1944') = '1906-1944' ;
+                                         c('1945-1959', '1960-1970') = '1945-1970' ;
+                                         c('1971-1980', '1981-1990') = '1971-1990' ")
+  
+  ## CW district
+  df_XL$CW_district_type <- recode(df_XL$CW_district_type, 
+                                   "c('Science Park Eindhoven', 'KA') = 'KA'")
+  
+  ## levels (order)
+  df_XL$EP_energieklasse <- factor(df_XL$EP_energieklasse, 
+                                   levels = c("below_C", "C","B","A","Above_A"))  
+  df_XL$building_period_renov <- factor(df_XL$building_period_renov, 
+                                        levels = c("before_1906","1906-1944","1945-1970",
+                                                   "1971-1990","1991-2000",
+                                                   "2001-2010","after_2010"))
+  df_XL$year_transaction <- factor(df_XL$year_transaction, 
+                                   levels = c("2010","2011","2012","2013",
+                                              "2014","2015","2017","2016","2018"))
+  df_XL$city_category <- factor(df_XL$city_category, 
+                                levels = c("small","large"))
+  df_XL$centrality <- factor(df_XL$centrality, 
+                             levels = c("decentral","central")) 
+  df_XL$CW_district_type <- factor(df_XL$CW_district_type, 
+                                   levels = c("KA","BE","GE","OTHER"))
+
+  
+``` 
+
+<br>
+
+---
+
+# 2. UNIVARIATE VISUALIZATIONS / INFORMAL DATA EXPLORATION
+
+<br>
+
+Next, we eyeball distributions. 
+
+<br>
+
+#### Continuous Variables
+
+For continous variables we use density plots and for categorical or ordinal we use bar plots. We start with the *continuous variables*. The red vertical line displays the mean.
+
+```{r include=FALSE}  
+
+  ## Transaction Prices
+  transaction_price.ds <- ggplot(df_XL, aes(x=purchase_price)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Transaction Price (xlimit: 100mil)", x ="", y = "") + scale_x_continuous(limit=c(0,100000000)) +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(purchase_price)), colour="darkred", linetype="dashed", size=1)
+  transaction_price.ds
+  
+  ## Log (Transaction Prices)
+  log_transaction_price.ds <- ggplot(df_XL, aes(x=log(purchase_price))) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Log Transaction Price", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(log(purchase_price))), colour="darkred", linetype="dashed", size=1)
+  log_transaction_price.ds
+  
+  ## Transfer date
+  transfer_date.ds <- ggplot(df_XL, aes(x=transfer_date)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Transfer Date", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(transfer_date)), colour="darkred", linetype="dashed", size=1)
+  transfer_date.ds
+  
+  ## Year built or last renovation
+  year_built.ds <- ggplot(df_XL, aes(x=year_built)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Year Built", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(year_built)), colour="darkred", linetype="dashed", size=1)
+  year_built.ds
+  
+  ## Total LFA
+  total_LFA.ds <- ggplot(df_XL, aes(x=total_LFA)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Total LFA (m2)", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(total_LFA)), colour="darkred", linetype="dashed", size=1)
+  total_LFA.ds
+
+  ## Building Height
+  building_height.ds <- ggplot(df_XL, aes(x=building_height )) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Building Height (m1)", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(building_height)), colour="darkred", linetype="dashed", size=1)
+  building_height.ds
+  
+  ## Parking Spots
+  parking_spots.ds <- ggplot(df_XL, aes(x=parking_spots)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Parking Spots", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(parking_spots)), colour="darkred", linetype="dashed", size=1)
+  parking_spots.ds
+
+  ## Walkscore
+  walkscore.ds <- ggplot(df_XL, aes(x=walkscore )) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Walkscore", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(walkscore)), colour="darkred", linetype="dashed", size=1)
+  walkscore.ds
+  
+  ## Leefbaarometer
+  lbm_total_score.ds <- ggplot(df_XL, aes(x=lbm_total_score)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Leefbaarometer", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(lbm_total_score)), colour="darkred", linetype="dashed", size=1)
+  lbm_total_score.ds
+  
+  ## Train Station Duration
+  train_station_duration.ds <- ggplot(df_XL, aes(x=train_station_duration)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Train Station Duration (min walking)", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(train_station_duration)), colour="darkred", linetype="dashed", size=1)
+  train_station_duration.ds
+ 
+  ## Highway Access Duration
+  highway_access_duration.ds <- ggplot(df_XL, aes(x=highway_access_duration)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Highway Access Duration (min driving)", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(highway_access_duration)), colour="darkred", linetype="dashed", size=1)
+  highway_access_duration.ds
+
+  ## TRI
+  TRI_per_sqm.ds <- ggplot(df_XL, aes(x=TRI_per_sqm)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="TRI per m2", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(TRI_per_sqm)), colour="darkred", linetype="dashed", size=1)
+  TRI_per_sqm.ds
+  
+  ## Vacancy perc
+  vacancy.ds <- ggplot(df_XL, aes(x=vacancy)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="Vacancy Percentage", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(vacancy)), colour="darkred", linetype="dashed", size=1)
+  vacancy.ds
+  
+  ## WALE
+  WALE.ds <- ggplot(df_XL, aes(x=WALE)) +
+    geom_density(fill='#A4A4A4', alpha = 0.3) + theme_bw() +
+    labs(title="WALE (incl. vacancy)", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    geom_vline(aes(xintercept=mean(WALE)), colour="darkred", linetype="dashed", size=1)
+  WALE.ds
+
+```  
+
+We then plot the density plots for the continuous variables. 
+
+```{r echo=FALSE, warning=FALSE}  
+
+  ## Price
+  ggMultiPlots(transaction_price.ds, 
+               log_transaction_price.ds,
+               cols=1)
+
+  ## Date
+  ggMultiPlots(transfer_date.ds,
+               cols=2)
+
+  ## Building
+  ggMultiPlots(year_built.ds, total_LFA.ds,
+               building_height.ds, parking_spots.ds,
+               cols=2)
+  
+  ## Location
+  ggMultiPlots(walkscore.ds, train_station_duration.ds,
+               lbm_total_score.ds, highway_access_duration.ds,
+               cols=2)
+  
+  ## Lease
+  ggMultiPlots(TRI_per_sqm.ds, vacancy.ds, 
+               WALE.ds,
+               cols=2)
+
+```  
+
+```{r include=FALSE} 
+
+  remove(transaction_price.ds)
+  remove(log_transaction_price.ds)
+  remove(transfer_date.ds)
+  remove(year_built.ds)
+  remove(total_LFA.ds)
+  remove(building_height.ds)
+  remove(parking_spots.ds)
+  remove(walkscore.ds)
+  remove(train_station_duration.ds)
+  remove(lbm_total_score.ds)
+  remove(highway_access_duration.ds)
+  remove(TRI_per_sqm.ds)
+  remove(vacancy.ds)
+  remove(WALE.ds)
+
+```
+
+<br>
+
+#### Categorical Variables
+
+Next we build the bar plots for the **categorical and ordinal variables**. 
+
+```{r echo=FALSE}  
+
+  ## Year Transaction 
+  year_transaction.hist <- ggplot(df_XL, aes(x=year_transaction)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    labs(title="Year Transaction", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y=element_blank())
+  year_transaction.hist
+ 
+  # Half-Year Transaction
+  halfyear_transaction.hist <- ggplot(df_XL, aes(x=halfyear_transaction)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    labs(title="Half-Year Transaction", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y=element_blank())
+  halfyear_transaction.hist
+  
+  ## Building Period (/ Renovation)
+  building_period_renov.hist <- ggplot(df_XL, aes(x=building_period_renov)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    labs(title="Year Built", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y=element_blank())
+  building_period_renov.hist
+  
+  ## Energy Label
+  EP_energieklasse.hist <- ggplot(df_XL, aes(x=EP_energieklasse)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    labs(title="Energy Label", x ="", y = "") +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y=element_blank())
+  EP_energieklasse.hist
+
+  # COROP region
+  COROP_region.hist <- ggplot(df_XL, aes(x=COROP_region)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    ylab('') + xlab('') +  ggtitle('COROP Region') +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y=element_blank()) 
+  COROP_region.hist
+  
+  ## City category
+  city_category.hist <- ggplot(df_XL, aes(x=city_category)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    labs(title="City Category", x ="", y = "")
+  city_category.hist
+  
+  ## Centrality
+  centrality.hist <- ggplot(df_XL, aes(x=centrality)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    labs(title="Centrality", x ="", y = "")
+  centrality.hist
+  
+  ## CW district
+  CW_district_type.hist <- ggplot(df_XL, aes(x=CW_district_type)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    labs(title="C&W District Type", x ="", y = "") 
+  CW_district_type.hist
+  
+  ## Underrented
+  underrented.hist <- ggplot(df_XL, aes(x=underrented)) +
+    geom_bar(fill='#A4A4A4', colour="black", alpha = 0.3) + theme_bw() +
+    geom_text(stat='count', aes(label=..count..), geom="text", vjust=-.2) +
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank()) +
+    labs(title="Over/Under Rented", x ="", y = "") 
+  underrented.hist
+
+```
+
+And then plot them. 
+
+```{r echo=FALSE, warning=FALSE}  
+  
+  ## Transaction date
+  ggMultiPlots(year_transaction.hist,
+               halfyear_transaction.hist,
+               cols=2)
+
+  ## Building
+  ggMultiPlots(building_period_renov.hist, EP_energieklasse.hist,
+               cols=2)
+
+    # Region - COROP
+  ggMultiPlots(COROP_region.hist,
+              cols=1)
+  
+  ## Region
+  ggMultiPlots(underrented.hist, city_category.hist, 
+               centrality.hist, CW_district_type.hist,
+               cols=2)
+
+``` 
+
+```{r include=FALSE} 
+
+  remove(year_transaction.hist)
+  remove(halfyear_transaction.hist)
+  remove(building_period_renov.hist)
+  remove(EP_energieklasse.hist)
+  remove(city_category.hist)
+  remove(centrality.hist)
+  remove(CW_district_type.hist)
+  remove(COROP_region.hist)
+  remove(underrented.hist)
+  
+``` 
+
+<br>
+
+---
+
+# 3. MULTIVARIATE EXPLORATION 
+
+<br>
+
+Next, we turn to multivariate exploration. But first we need to shift the minimum in order to allow for logarithmic functions applied to zero.
+
+<br>
+
+#### Data Transformations
+
+Because logarithm functions cannot be calculated over zero (goes to infinite) we add 1 to every observation where this is necessary 
+
+```{r}
+
+  ## parking spots
+  min(df_XL$parking_spots)
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(parking_spots = parking_spots + 1)
+  
+  ## Effective Age
+  min(df_XL$effective_age)
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(effective_age = effective_age + 1)
+  
+  ## WALE
+  min(df_XL$WALE)
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(WALE = WALE + 1)
+  
+  ## Distance to Station
+  min(df_XL$train_station_duration)
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(train_station_duration = train_station_duration + 1)
+
+  ## Distance to Highway
+  min(df_XL$highway_access_duration)
+  df_XL <- df_XL %>% dplyr::rowwise() %>%
+           dplyr::mutate(highway_access_duration = highway_access_duration + 1)
+   
+ 
+```
+
+The multivariate outlier analysis needs log functions as a variable.
+
+```{r}  
+
+  df_XL$log_purchase_price <- log(df_XL$purchase_price)
+  df_XL$log_total_LFA <- log(df_XL$total_LFA)
+  df_XL$log_effective_age <- log(df_XL$effective_age)
+  df_XL$log_building_height <- log(df_XL$building_height)
+  df_XL$log_parking_spots <- log(df_XL$parking_spots)
+  df_XL$log_walkscore <- log(df_XL$walkscore)
+  df_XL$log_train_station_duration <- log(df_XL$train_station_duration)
+  df_XL$log_highway_access_duration <- log(df_XL$highway_access_duration)
+  df_XL$log_TRI_per_sqm <- log(df_XL$TRI_per_sqm)
+  df_XL$log_WALE <- log(df_XL$WALE)
+   
+```
+
+<br>
+
+#### Correlations
+
+We start by building a scatter plot matrix involving some of the most important variables in the transaction data.
+
+```{r message=FALSE}  
+
+  ## correlation (continuous) data
+  corr_data <- dplyr::select(.data=df_XL, 
+                             purchase_price,
+                             effective_age,
+                             total_LFA,
+                             building_height,
+                             parking_spots,
+                             train_station_duration,
+                             highway_access_duration,
+                             walkscore,
+                             lbm_total_score,
+                             vacancy,
+                             TRI_per_sqm,
+                             WALE)
+
+  colnames(corr_data) <- c("Transaction.Price", "Age", "LFA", "Building.Height", "Parking.Spots", 
+                           "Train.Station.Distance", "Highway.Access.Distance", "Walkscore", 
+                           "Leefbaarometer", "Vacancy.Percentage", 
+                           "TRI.per.sqm", "WALE.incl.Vacancy")
+                             
+  ## output corr matrix
+  # corr_matrix <- cor(corr_data)
+  # round(corr_matrix, 2)
+
+  ## output corr graph
+  par(mar=c(20,100,0,0))
+  ggcorr(corr_data, label=TRUE, hjust = 0.90, size = 3.5)
+
+```
+
+<br>
+
+---
+
+#### Scatter Plots
+
+To get a better look at the bivariate relationship between the independent variables and transaction price, we create individual *scatter plots*.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}  
+
+  ## transfer date
+  ggplot(df_XL, aes(x=transfer_date , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Transfer Date", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+
+  ## total LFA
+  ggplot(df_XL, aes(x=total_LFA , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Total LFA", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10(labels = scales::comma)
+
+  ## effective age
+  ggplot(df_XL, aes(x=year_built , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Year Built", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) #+ scale_x_log10()
+  
+  ## Building height
+  ggplot(df_XL, aes(x=building_height , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Building Height", x ="", y = "") +
+     scale_y_log10(labels = scales::comma) + scale_x_log10()
+
+  ## Parking spots
+  ggplot(df_XL, aes(x=parking_spots , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Parking Spots", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10()
+
+  ## Walkscore
+  ggplot(df_XL, aes(x=walkscore , y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Walkscore", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) 
+    
+  ## lbm score
+  ggplot(df_XL, aes(x=lbm_total_score, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Leefbaarometer (from National average)", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## station durdation
+  ggplot(df_XL, aes(x=train_station_duration, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Train Station (min. walking)", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10()
+
+  ## highway duration
+  ggplot(df_XL, aes(x=highway_access_duration, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Highway Access (min. driving)", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10()
+  
+  ## vacancy perc
+  ggplot(df_XL, aes(x=vacancy, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="Vacancy Percentage", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_continuous(labels = scales::percent)
+  
+  ## TRI per sqm
+  ggplot(df_XL, aes(x=TRI_per_sqm, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="TRI per m2", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10()
+  
+  ## WALE
+  ggplot(df_XL, aes(x=WALE, y=purchase_price)) +
+    geom_point(alpha=0.4) + theme_bw() + stat_smooth(colour="darkred") +
+    labs(title="WALE (incl. vacancy)", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) + scale_x_log10()
+  
+```
+
+<br>
+
+---
+
+#### BoxPlot
+
+And for the categorical and ordinal variables, we create boxplots.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}  
+
+  ## Year Transaction
+  ggplot(df_XL, aes(x=year_transaction, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="Year Transaction", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+
+  ## Building period
+  ggplot(df_XL, aes(x=building_period, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="Year Built", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## Energy label
+  ggplot(df_XL, aes(x=EP_energieklasse, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="Energy Label", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## City category
+  ggplot(df_XL, aes(x=city_category, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="City Category", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## Centrality
+  ggplot(df_XL, aes(x=centrality, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="Centrality", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## CW district
+  ggplot(df_XL, aes(x=CW_district_type, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="C&W District Type", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+  ## Over / underrented 
+  ggplot(df_XL, aes(x=underrented, y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="Over/Under Rented", x ="", y = "") +
+    scale_y_log10(labels = scales::comma)
+  
+```
+
+
+<br>
+
+---
+
+# 4. MAPPING VARIABLES
+
+<br>
+
+Some figures used in thesis text.
+
+
+#### Location
+
+```{r}  
+
+  ## confidential!
+  
+```
+
+<br>
+
+#### Time
+
+```{r}  
+
+give.n <- function(x){
+   return(c(y = mean(x), label = length(x)))
+}
+
+  ## CW district
+  ggplot(df_XL, aes(x=as.factor(halfyear_transaction), y=purchase_price)) +
+    geom_jitter(alpha = 0.2) + theme_bw() + geom_boxplot(fill='#A4A4A4', alpha = 0.4) +
+    stat_summary(fun.data = give.n, geom = "text", vjust = -1, size=4) +
+    stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE) + 
+    labs(title="", x ="", y = "") +
+    scale_y_log10(labels = scales::comma) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+```
+
+We could also map the variables over space. Less relevant however for Commercial Real Estate as few observations in dataset.
+
+<br>
+
+---
+
+# 5. DISCORDANT VALUES
+
+<br>
+
+Finally, based on the exploration above, we deal with the discordant values.  We take a 'label and test' approach, by labeling the discordant values in this step and then testing for their impact in the modeling step that follows.  
+
+We start by adding three new fields to the sales data:
+
+1. Discordant: Binary indicating discordant or not
+2. disc_fields: Text field with all fields that are discordant
+3. disc_type: Text field with the type of discordancy for each discordant field
+
+Each of these is set to 0 or blank to begin.
+
+```{r}  
+
+  df_XL$discordant_uv1 <- 0
+  df_XL$discordant_mv1 <- 0
+  df_XL$discordant_mv2 <- 0
+  df_XL$disc_fields <- ""
+  df_XL$disc_type <- ""
+  
+```
+
+<br>
+
+#### Univariate (UV) discordants
+
+First, we apply a discordant label to a number of key fields based on their values.  Particularly, we label all values below the 1% quantile or above the 99% quantile as potentially discordant. These are Univariate (UV) discordants.
+
+```{r}  
+    
+  ## Transaction pirce
+  spd <- which(df_XL$purchase_price > quantile(df_XL$purchase_price, .995) |
+               df_XL$purchase_price < quantile(df_XL$purchase_price, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'purchase_price | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')
+
+  ## Year built (early years only)
+  spd <- which(df_XL$year_built < quantile(df_XL$year_built, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'year_built | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')
+  
+  ## total LFA
+  spd <- which(df_XL$total_LFA > quantile(df_XL$total_LFA, .99) |
+               df_XL$total_LFA < quantile(df_XL$total_LFA, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'total_LFA | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')
+  
+  ## building Height
+  spd <- which(df_XL$building_height > quantile(df_XL$building_height, .99) |
+               df_XL$building_height < quantile(df_XL$building_height, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'building_height | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+  
+  ## Parking spots (hihg only)
+  spd <- which(df_XL$parking_spots > quantile(df_XL$parking_spots, .99))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'parking_spots | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+  
+  ## Walkscore
+  spd <- which(df_XL$walkscore > quantile(df_XL$walkscore, .99) |
+               df_XL$walkscore < quantile(df_XL$walkscore, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'walkscore | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+  
+  ## Train station duration (high only)
+  spd <- which(df_XL$train_station_duration > quantile(df_XL$train_station_duration, .99))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'train_station_duration | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+  
+  ## Highway access duration (high only)
+  spd <- which(df_XL$highway_access_duration > quantile(df_XL$highway_access_duration, .99))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'highway_access_duration | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')   
+  
+  ## Leefbaarometer
+  spd <- which(df_XL$lbm_total_score > quantile(df_XL$lbm_total_score, .99) |
+               df_XL$lbm_total_score < quantile(df_XL$lbm_total_score, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'lbm_total_score | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+  
+  ## TRI
+  spd <- which(df_XL$TRI_per_sqm > quantile(df_XL$TRI_per_sqm, .99) |
+               df_XL$TRI_per_sqm < quantile(df_XL$TRI_per_sqm, .01))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'TRI_per_sqm | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')   
+    
+  ## WALE (high only)
+  spd <- which(df_XL$WALE > quantile(df_XL$WALE, .99))
+  df_XL$discordant_uv1[spd] <- 1
+  df_XL$disc_fields[spd] <- paste0(df_XL$disc_fields[spd], 'WALE | ')
+  df_XL$disc_type[spd] <- paste0(df_XL$disc_type[spd], 'UV: 1% Quant | ')  
+
+```
+
+<br>
+
+#### Multivariate (MV) discordants
+
+Finally, we find the LFA and price relationship to be one of the strongest relationships in the data.  From this relationship we label multivariate (MV) discordant values using a multiple step process. 
+
+We begin by defining a customized function for the output.  
+
+```{r}  
+
+  ##  mahalabonis distance function
+  mahalabonis.dist <- function(y, x, df){
+  
+    # Multivariate discordancy
+    x.data <- data.frame(y = df[,deparse(substitute(y))],
+                         x = df[,deparse(substitute(x))])
+    x.data$x.mah <- mahalanobis(x.data, colMeans(x.data), cov(x.data))
+    cuts <- quantile(x.data$x.mah, probs=c(0, .8, .9, .95, .99, .999, 1))
+    x.data$mah.col <- as.numeric(as.factor(cut(x.data$x.mah, cuts))) 
+    x.data$discordant <- df$discordant
+    
+    x.disc.5 <- which(x.data$mah.col > 4)
+    x.disc.6 <- which(x.data$mah.col > 5)
+    
+    plot <- ggplot(x.data, aes(x=x.data[1], y=x.data[2], color=as.factor(mah.col),
+                               size=sqrt(mah.col) / 2)) +
+      xlab(colnames(x.data)[1]) + ylab(colnames(x.data)[2]) +
+      theme_bw() + geom_point() + 
+      scale_color_manual(values=c('gray70', 'gray55', 'gray40', 'gray15', 'orange', 'red')) +
+  
+    my_list <- list("plot" = plot, "x.disc.5" = x.disc.5, "x.disc.6" = x.disc.6)
+  
+    return(my_list)
+  }
+  
+
+```
+
+Next, we make the plots. 
+
+Notice that we use the transformed functions. 
+We only compare the independent variables with the dependent variables in this thesis.
+
+```{r warning=FALSE, message=FALSE}  
+
+  ## LFA
+  mah.out <- mahalabonis.dist(log_purchase_price, log_total_LFA, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 
+                                                    'price vs log_total_LFA | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 
+                                                  'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 
+                                                    'price vs log_total_LFA | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 
+                                                  'MV: 0.1% Mah Quant | ')
+    mah.out$plot
+    
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}  
+
+  ## Building Height
+  mah.out <- mahalabonis.dist(log_purchase_price, log_building_height, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_building_height | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_building_height | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot
+    
+  ## Parking Spots
+  mah.out <- mahalabonis.dist(log_purchase_price, log_parking_spots, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_parking_spots | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_parking_spots | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot
+
+  ## Walkscore
+  mah.out <- mahalabonis.dist(log_purchase_price, log_walkscore, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_walkscore | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_walkscore | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot  
+    
+  ## Leefbaarometer
+  mah.out <- mahalabonis.dist(log_purchase_price, lbm_total_score, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs lbm_total_score | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs lbm_total_score | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot  
+    
+  ## Train Station Distance
+  mah.out <- mahalabonis.dist(log_purchase_price, log_train_station_duration, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_train_station_duration | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_train_station_duration | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot     
+  
+  ## Highway Access Distance
+  mah.out <- mahalabonis.dist(log_purchase_price, log_highway_access_duration, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_highway_access_duration | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_highway_access_duration | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot 
+
+  ## WALE
+  mah.out <- mahalabonis.dist(log_purchase_price, log_WALE, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_WALE | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_WALE | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot
+    
+  ## Vacancy Percentage
+  mah.out <- mahalabonis.dist(log_purchase_price, vacancy, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs vacancy | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs vacancy | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot 
+    
+  ## Theoretical Rental Income (per m2)
+  mah.out <- mahalabonis.dist(log_purchase_price, log_TRI_per_sqm, df_XL)
+      df_XL$discordant_mv1[mah.out$x.disc.5] <- 1
+      df_XL$disc_fields[mah.out$x.disc.5] <- paste0(df_XL$disc_fields[mah.out$x.disc.5], 'price vs log_TRI_per_sqm | ')
+      df_XL$disc_type[mah.out$x.disc.5] <- paste0(df_XL$disc_type[mah.out$x.disc.5], 'MV: 1% Mah Quant | ')
+      df_XL$discordant_mv2[mah.out$x.disc.6] <- 1
+      df_XL$disc_fields[mah.out$x.disc.6] <- paste0(df_XL$disc_fields[mah.out$x.disc.6], 'price vs log_TRI_per_sqm | ')
+      df_XL$disc_type[mah.out$x.disc.6] <- paste0(df_XL$disc_type[mah.out$x.disc.6], 'MV: 0.1% Mah Quant | ')
+    mah.out$plot    
+    
+  ## Clear memory
+  remove(mahalabonis.out)
+  
+```
+
+<br>
+
+---
+
+# 6. FINALIZE
+
+<br>
+
+To finish the *Data Exploration* and *Data Cleaning* phase we write the data back to the database. First, limit to only the necessary variables.
+
+create modelling set
+
+```{r eval=FALSE}  
+
+  # Transform:  Limit field name
+  df_XL <- dplyr::select(.data=df_XL,
+
+       ## TRANSACTION INFO
+          BOG_ID,                 # unique ID to link back to database
+          purchase_price,         # dependent variable
+          transfer_date,          # transaction date (finest granularity)
+          year_transaction,       # transaction year (wide granularity)
+          halfyear_transaction,   # transaction halfyear
+          latitude,               # lattitude
+          longitude,              # longitude
+       ## BUILDING FACTORS
+          year_built,             # year built
+          year_built_or_renov,    # year built or last renovated
+          effective_age,          # years between transaction and last renovation
+          building_period,        # building periods
+          building_period_renov,  # distinct buiding periods
+          total_LFA,              # building size
+          building_height,        # building height
+          EP_energieklasse,       # energy performance (green building)
+          parking_spots,          # number of parking spots (inside and/or outside)
+       ## LOCATION FACTORS
+          COROP_region,           # often used for statistical research
+          city_category,          # large or small city
+          centrality,             # walking distance of intercity station
+          CW_district_type,       # indicator: kantoorgebied, bedrijfsgebied, gemengd, other.
+          walkscore,              # score for ammenities with walkscore api
+          train_station_duration, # min walking to nearest station
+          highway_access_duration,# min driving to nearest highway access
+          lbm_total_score,        # leefbaarometer (later split up)
+       ## LEASE FACTORS
+          vacancy,           # amount of LFA vacant at time of sale (as percent of total LFA)
+          TRI_per_sqm,            # total theoretical rental income (includes value for vacancy)
+          WALE,                    # remaining lease term including vacancy m2
+          underrented,             # rental income above or under market rent
+       ## OUTLIERS
+          discordant_uv1,
+          discordant_mv1,
+          discordant_mv2,
+          disc_fields,
+          disc_type
+                                  )
+
+```
+
+Note that we first we need to convert the transaction date back to a character value.
+
+```{r} 
+
+  ## date to string
+  df_XL <- dplyr::mutate(df_XL, transfer_date = as.character(transfer_date))
+
+  ## write back to database
+  try(sqlDrop(db.conn, "tbl4_data_cleaned", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl4_data_cleaned", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = NA)
+
+```
+
+And close the connection to the database. 
+
+```{r}  
+
+  ## close db connection
+  odbcCloseAll()
+  remove(db.conn)
+  rm(list = ls())
+
+```
+
+---
+
+> Go back to [top](#top)

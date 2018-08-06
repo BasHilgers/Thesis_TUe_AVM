@@ -1,0 +1,841 @@
+---
+title: 'PHASE 1: DATA GATHERING'
+subtitle: "Thesis TUe - Automated Valuation Model for Commercial Real Estate"
+author: "Bas Hilgers | Data: Cushman&Wakefield (confidential)"
+date: "August 2018"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+---
+
+<style type="text/css">
+.main-container {
+  max-width: 1200px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+<a id="top"></a>
+
+---
+
+# 1. INTRODUCTION
+
+<br>
+
+In the first phase of our Analytical Workflow we explain how we *gather data* from a variety of (semi) public sources. The codes below will make use of APIs, personal (Access) databases and GIS. 
+
+*Note*: Some sources are invalid as is. Customize to functions found in **R_code_API_requests.Rmd**.
+
+First we specify the directory into which the downloaded data will be stored, unzipped, etc. In addition we specifiy some necessary options for the process.
+
+```{r eval=FALSE}
+
+  ## libraries
+  library(knitr)   # publication options markdown
+  library(RODBC)   # database connection
+  library(rgdal)   # GIS
+  library(dplyr)   # data manipulation
+  library(plyr)    # data manipulation
+
+```
+
+Set directories and global options.
+
+```{r set-options}
+
+  ## Set data and code directory
+  wd.dir   <- file.path('C:/Users/bashi/Desktop/TUe Thesis')
+  data.dir <- file.path(wd.dir, '5 Data', 'AVM database')
+  code.dir <- file.path(wd.dir, '6 Modelling', 'modules')
+  
+  ## file options
+  options(width=120) # control width output
+  knitr::opts_chunk$set(out.width='800px', dpi=200) # control width figures
+  options(scipen=999)
+  options(stringsAsFactors = FALSE)
+  
+```
+
+Next we load a set of **custom functions** that are used during the data gathering phase.
+
+```{r eval=FALSE}
+
+  source(paste0(code.dir, '/custom_functions_data_gathering.R'))
+
+```
+
+We load the raw **input data** into memory that contains the transactions including an list of addressses for which additional data needs to be gathered.
+
+```{r eval=FALSE}
+
+  ## establish db connection
+  db.conn <- odbcConnectAccess2007(file.path(data.dir, 'AVM_database.accdb'))
+
+  ## Read in sales data
+  df_XL <- sqlFetch(db.conn, "tbl2_data_managed")
+  df_XL$comments_transaction <- NULL # too large datafields
+
+```
+
+We divide the data into Chunks in order to limit our data as we are bound by 1000 requests per day due to our API key and preview our data.
+
+```{r eval=FALSE}
+
+  ## chunck raw data
+  df_XL <- df_XL %>% slice(1:1000)
+  df_XL <- df_XL %>% dplyr::arrange(BOG_ID)
+
+  ## preview data structure
+  names(df_XL)
+                                      
+```
+
+We subset the data to include only necessary variables. Observations that are not useable (yet) are ecxluded from the data. That is, if they don't have an location or data. The missing data is saved as a .csv for further exploration.
+
+```{r eval=FALSE}
+
+  # select complete datapoints only
+  df_XL <- dplyr::select(.data=df_XL, BOG_ID, housenumber, postcode)
+
+  ## exclude missing data 
+  df_XL <- df_XL %>% dplyr::filter(!is.na(BOG_ID) & !is.null(BOG_ID ) & BOG_ID != "")
+  df_XL <- df_XL %>% dplyr::filter(!is.na(housenumber) & !is.null(housenumber) & housenumber != "")
+  df_XL <- df_XL %>% dplyr::filter(!is.na(postcode) & !is.null(postcode) & postcode != "")
+  
+  head(df_XL)
+
+```
+ 
+<br>
+
+---
+
+# 2. DATA GATHERING
+
+<br>
+
+### A. BAG information
+
+First, we obtain *geographical information* about the properties through the BAG API. Variables obtained are 'longitude' and 'lattitude' plus the links to 'openbare ruimte' and 'pandrelatering'.
+
+```{r eval=FALSE, message=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_BAG_LL.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_verblijfsobject <- GET_verblijfsobject(df_XL$housenumber, df_XL$postcode)
+  
+  ## append data
+  df_XL$longitude <- OUTPUT_verblijfsobject$lng
+  df_XL$latitude <- OUTPUT_verblijfsobject$lat
+  
+```
+
+Second, we get information about the *public space*. Variables obtained are the 'streetname' and 'city'.
+
+```{r eval=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_BAG_public_space.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_public_space <- GET_public_space(OUTPUT_verblijfsobject$link_openbareruimte)
+  
+  ## append data
+  df_XL$streetname <- OUTPUT_public_space$street
+  df_XL$city <- OUTPUT_public_space$city
+  
+```
+
+Rename 's Gravenhage to 'Den Haag'
+
+```{r eval=FALSE} 
+
+  df_XL$city <- gsub("'s-Gravenhage", "Den Haag", df_XL$city)
+
+```
+
+Third, we obtain the *building info*. Variables obtained are the 'BAG_object_ID' and 'construction_year'.
+
+```{r eval=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_BAG_building_info.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_BAG_object <- GET_object_info(OUTPUT_verblijfsobject$link_pandrelatering)
+  
+  ## append data
+  df_XL$BAG_object_ID <- OUTPUT_BAG_object$BAG_object_ID
+  df_XL$BAG_construction_year <- OUTPUT_BAG_object$construction_year 
+  
+```
+
+
+Last, we clear some of our memory in R and show data structure.
+
+```{r eval=FALSE}  
+
+  ## clean memory
+  remove(OUTPUT_BAG_object)
+  remove(OUTPUT_public_space)
+  remove(OUTPUT_verblijfsobject)
+  
+  ## preview data
+  str(df_XL)
+  
+```
+
+<br>
+
+### B. Region info
+
+We obtain information about the regions in which the property is situated that is often used as an ID. The data is stored in an access database and is obtained based on the PC6 code. If not found, use broader pc4 code.
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.region <- odbcConnectAccess2007(file.path(data.dir, 'Regions_data.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    
+    ## query
+    query <- sprintf("SELECT * FROM regions_NUTS WHERE postcode6 = '%s';", df_XL$postcode[i])
+    data <- sqlQuery(db.region , query)
+    
+    ## append data
+    if (dim(data)[1] != 0){
+      df_XL$NUTS1_ID[i] <- as.character(data$NUTS1_ID)
+      df_XL$NLD_region[i] <- as.character(data$Lands)
+      df_XL$NUTS2_ID[i] <- as.character(data$NUTS2_ID)
+      df_XL$COROP_region[i] <- as.character(data$COROP_region)
+      df_XL$NUTS3_ID[i] <- as.character(data$NUTS3_ID)
+      df_XL$provinciecode[i] <- as.character(data$provinciecode)
+      df_XL$provincie[i] <- as.character(data$provincie)
+      df_XL$gemeentecode[i] <- as.character(data$gemeentecode)
+      df_XL$gemeente[i] <- as.character(data$gemeente)
+      df_XL$wijkcode[i] <- as.character(data$wijkcode)
+      df_XL$wijk[i] <- as.character(data$wijk)
+      df_XL$buurtcode[i] <- as.character(data$buurtcode)
+      df_XL$buurt[i] <- as.character(data$buurt)
+    }
+    
+    ## clean memory
+    remove(data)
+    remove(query)
+  }
+
+  ## close connection
+  odbcClose(db.region)
+  remove(db.region)
+
+```
+
+
+<br>
+
+### C. CW region
+
+Next, load spatial polygon data.
+
+```{r eval=FALSE}  
+
+  ## load GIS (polygons and distict info)
+  GIS_kantoren <- readOGR(dsn=file.path(data.dir,'CW.gdb'), "Kantoren", verbose=FALSE)
+  GIS_bedrijfsruimte <- readOGR(dsn=file.path(data.dir,'CW.gdb'), "Bedrijfsruimte", verbose=FALSE)
+  
+  for(i in 1:nrow(df_XL)){
+    if(!is.na(df_XL$lng[i]) && !is.na(df_XL$lat[i])){
+    
+      ## create spatial point for the subject property
+      coords = cbind(df_XL$lng[i], df_XL$lat[i])
+      sp = SpatialPoints(coords)
+      
+      ## allign projections
+      proj4string(sp) <- proj4string(GIS_kantoren)
+      
+      ## check whether point subject property falls within polygon CW regions
+      DLF_naam <- over(sp, GIS_kantoren) 
+      if(!is.na(DLF_naam$FileName[1])) {
+        
+        ## append data kantoorgebied ## rename to CW_district..
+        df_XL$CW_district_ID[i] <- as.character(DLF_naam$Deelgebied_id[1]) 
+        df_XL$CW_district_name[i] <- as.character(DLF_naam$Deelgebied_naam[1])
+        df_XL$CW_district_type[i] <- as.character(DLF_naam$Segment[1])     
+      
+      } else {
+        
+        # check bedrijventerreinen
+        DLF_naam <- over(sp, GIS_bedrijfsruimte) 
+        
+        ## append data bedrijfsterrein
+        df_XL$CW_district_ID[i] <- as.character(DLF_naam$DLG_Num[1])
+        df_XL$CW_district_name[i] <- as.character(DLF_naam$DLG_Naam[1])
+        df_XL$CW_district_type[i] <- as.character(DLF_naam$Segment[1]) 
+        
+      }
+
+      ## clean memory
+      remove(DLF_naam)
+    }
+  }
+  
+  ## replace NA with OTHER
+  df_XL$CW_district_ID[is.na(df_XL$CW_region_ID)] <- "OTHER"
+  df_XL$CW_district_name[is.na(df_XL$CW_region_name)] <- "OTHER"
+  df_XL$CW_district_type[is.na(df_XL$CW_region_segment)] <- "OTHER"
+
+  ## clean memory
+  remove(sp)
+  remove(GIS_bedrijfsruimte)
+  remove(GIS_kantoren)
+  remove(coords)
+  
+  ## what to do if both KA and BE? GE, but which name?
+
+```
+
+Last, we check wheter the city is large / small
+
+```{r eval=FALSE}
+
+  ## city categories
+  city_cat <- c("Amsterdam", "Amsterdam-Zuidoost","Amsterdam_duivendrecht", "Schiphol-Rijk", 
+                "Hoofddorp", "Rotterdam", "Den Haag", "Utrecht", "Eindhoven")
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(city_category = ifelse(city %in% city_cat,"large", "small"))
+
+```
+
+<br>
+
+### D. Energie prestatie score
+
+Get EP data. If not found, search for closest building to number that has highest probability to show a similar label.
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.ep <- odbcConnectAccess2007(file.path(data.dir, 'energie_prestatie.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    
+    ## query
+    query <- sprintf("SELECT TOP 1 pand_postcode, pand_huisnummer, pand_energieklasse, 
+                                   pand_gebouwtype, pand_gebouwsubtype
+                      FROM V20180501_csv
+                      WHERE pand_postcode = '%s'
+                      ORDER BY ABS( pand_huisnummer - %g );",
+                      df_XL$postcode[i], df_XL$housenumber[i])
+
+    ## get data
+    data <- sqlQuery(db.ep , query)
+
+    ## append data
+    if (length(data)[1] != 2){
+    df_XL$EP_huisnummer[i] <- as.numeric(data$pand_huisnummer[1])
+    df_XL$EP_postcode[i] <- as.numeric(data$pand_postcode[1])
+    df_XL$EP_energieklasse[i] <- as.character(data$pand_energieklasse[1])
+    df_XL$EP_gebouwtype[i] <- as.character(data$pand_gebouwtype[1])
+    df_XL$EP_gebouwsubtype <- as.character(data$pand_gebouwsubtype[1])
+    }
+    ## clean memory
+    remove(data)
+    remove(query)
+  }
+  
+  ## data mutations
+  df_XL$EP_energieklasse <- gsub(FALSE, "F", df_XL$EP_energieklasse)
+  
+  ## close connection
+  odbcClose(db.ep)
+  remove(db.ep)
+
+```
+
+<br>
+
+### E. Building height
+
+We obtain de building heigts from our personal database. Data obtained from *3D gebouwhoogte NL* from PDOK.
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.height <- odbcConnectAccess2007(file.path(data.dir, 'building_heights.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    if(!is.na(df_XL$BAG_object_ID[i])){
+      
+      ## query
+      query <- sprintf("SELECT * FROM building_heights_NLD WHERE ID = '%s';", 
+                       as.numeric(df_XL$BAG_object_ID[i]))
+      data <- sqlQuery(db.height , query)
+      
+      ## append data
+      if(dim(data)[1] != 0){
+        if(data$height_max[1] < data$height_avg[1]){
+          df_XL$building_height[i] <- data$height_avg[1]
+        } else {
+          df_XL$building_height[i] <- data$height_max[1]
+        }
+      }
+      ## clean memory
+      remove(data)   
+      remove(query)
+      
+    }
+  }
+
+  ## close connection
+  odbcClose(db.height)
+  remove(db.height)
+  
+
+```
+
+<br>
+
+### F. Leefbaarometer
+
+We obtain de leefbaarometer from our personal database that is constructed with data from *CBS*.
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.lbm <- odbcConnectAccess2007(file.path(data.dir, 'leefbaarometer.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    if(!is.na(df_XL$buurtcode[i])){
+      
+      ## select relevant year
+      #year = substring(df_XL$date_transaction[i],7,10)
+      year = as.numeric(substr(df_XL$transaction_date[i], 1, 4))
+      if (is.na(year)) { year = df_XL$year[(i-1)] } # previous observation (observed around same period)
+      if (is.na(year)) { year = 2016 } # no previous than 2016
+      if (year > 2014) {year = 2016
+      } else if (year > 2012) {year = 2014
+      } else (year = 2012)
+      
+      ## query buurt
+      query <- sprintf("SELECT * FROM buurt_2016_stand_panel WHERE GBD = '%s' AND JAAR = %d;", 
+                       as.character(df_XL$buurtcode[i]), as.numeric(year))
+      data <- sqlQuery(db.lbm , query)
+      
+        ## if no buurt score take try broader neighborhood score
+        if(is.na(data$RLBRMTR[1])) {
+          query <- sprintf("SELECT * FROM wijk_2016_stand_panel WHERE GBD = '%s' AND JAAR = %d;", 
+                           as.character(df_XL$wijkcode[i]), as.numeric(year))
+          data <- sqlQuery(db.lbm , query)        
+        }
+      
+        ## if no neighborhood score take broader municipality score
+        if(is.na(data$RLBRMTR[1])) {
+          query <- sprintf("SELECT * FROM gemeente_2016_stand_panel WHERE GBD = '%s' AND JAAR = %d;", 
+                           as.character(df_XL$gemeentecode[i]), as.numeric(year))
+          data <- sqlQuery(db.lbm , query)        
+        }
+      
+      ## append data
+      df_XL$lbm_district[i] <- as.character(data$GBD)[1]
+      df_XL$lbm_year[i] <- as.numeric(data$JAAR)[1]
+      df_XL$lbm_total_score[i] <- as.numeric(data$RLBRMTR)[1]
+      df_XL$lbm_woningen[i] <- as.numeric(data$RLBWON)[1]
+      df_XL$lbm_bewoners[i] <- as.numeric(data$RLBBEV)[1]
+      df_XL$lbm_voorzieningen[i] <- as.numeric(data$RLBVRZ)[1]
+      df_XL$lbm_veiligheid[i] <- as.numeric(data$RLBVEI)[1]
+      df_XL$lbm_fysieke_omgeving[i] <- as.numeric(data$RLBFYS)[1]
+      
+      ## clean memory
+      remove(data)
+      remove(query)  
+      remove(year)
+      
+    }
+  }
+
+  ## close connection
+  odbcClose(db.lbm)
+  remove(db.lbm)
+
+
+```
+
+<br>
+
+### G. Walkscore
+
+Next, get walkscore with use of the API.
+
+```{r eval=FALSE}  
+
+  ## Source of function
+  source(file.path(code.dir, 'GET_walkscore.R'))
+
+  ## GET data
+  OUTPUT_walkscore <- GET_walkscore(address_number = df_XL$address_number, 
+                                    streetname = df_XL$streetname, 
+                                    postcode = df_XL$postcode,
+                                    city = df_XL$city, 
+                                    lat = df_XL$lat,
+                                    lng = df_XL$lng)
+
+  ## append data
+  df_XL$walkscore <- OUTPUT_walkscore$walkscore
+  df_XL$walkscore_date <- OUTPUT_walkscore$walkscore_date
+  df_XL$walkscore_link <- OUTPUT_walkscore$walkscore_link
+  
+  ## clean memory
+  remove(OUTPUT_walkscore)
+  
+```
+
+<br>
+
+### H. Nearest highway access
+
+First, obtain de (geo)location of the 2 nearest highway exits based on distance (pythagoras). 
+Note: the closest in distance doesn't have to be the fastest!
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.highway <- odbcConnectAccess2007(file.path(data.dir, 'transportation.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    if(!is.na(df_XL$lat[i]) && !is.na(df_XL$lng[i])){
+      
+      ## query
+      query <- sprintf("SELECT TOP 2 name, lat, lng
+                        FROM highway_exits
+                        ORDER BY sqr(((lat-%s)^2+(lng-%s)^2));", 
+                        df_XL$lat[i], df_XL$lng[i])
+      
+      ## get query data
+      data <- sqlQuery(db.highway , query)
+      
+      ## append data
+      df_XL$highway_name1[i] <- as.character(data$name[1])
+      df_XL$highway_lat1[i] <- data$lat[1]
+      df_XL$highway_lng1[i] <- data$lng[1]
+      df_XL$highway_name2[i] <- as.character(data$name[2])
+      df_XL$highway_lat2[i] <- data$lat[2]
+      df_XL$highway_lng2[i] <- data$lng[2]
+      
+      ## clean memory
+      remove(data)
+      remove(query)
+      
+    }
+  }
+
+  ## close connection
+  odbcClose(db.highway)
+  remove(db.highway)
+  
+```
+
+Second, we obtain info about the duration and distance and select the option that is closest timewise:
+
+```{r eval=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_google_distances_duration.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$lat,
+                                                          lng_object = df_XL$lng,
+                                                          lat_place = df_XL$highway_lat1,
+                                                          lng_place = df_XL$highway_lng1,
+                                                          mode = "driving")
+  
+  ## append data
+  df_XL$highway_distance1 <- OUTPUT_google_duration$distance
+  df_XL$highway_duration1 <- OUTPUT_google_duration$duration
+  
+  ## GET verblijfsobject data
+  OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$lat,
+                                                          lng_object = df_XL$lng,
+                                                          lat_place = df_XL$highway_lat2,
+                                                          lng_place = df_XL$highway_lng2,
+                                                          mode = "driving")
+  
+  ## append data
+  df_XL$highway_distance2 <- OUTPUT_google_duration$distance
+  df_XL$highway_duration2 <- OUTPUT_google_duration$duration
+  
+  
+  ## nearest highway among 2 options
+    for(i in 1:nrow(df_XL)){
+      if(!is.na(df_XL$highway_duration2[i])){
+      if(df_XL$highway_duration1[i] < df_XL$highway_duration2[i]){
+        df_XL$highway_access_name[i] <- df_XL$highway_name1[i]
+        df_XL$highway_access_lat[i] <- df_XL$highway_lat1[i]
+        df_XL$highway_access_lng[i] <- df_XL$highway_lng1[i]
+        df_XL$highway_access_distance[i] <- df_XL$highway_distance1[i]
+        df_XL$highway_access_duration[i] <- df_XL$highway_duration1[i]
+      } else {
+        df_XL$highway_access_name[i] <- df_XL$highway_name2[i]
+        df_XL$highway_access_lat[i] <- df_XL$highway_lat2[i]
+        df_XL$highway_access_lng[i] <- df_XL$highway_lng2[i]
+        df_XL$highway_access_distance[i] <- df_XL$highway_distance2[i]
+        df_XL$highway_access_duration[i] <- df_XL$highway_duration2[i]
+      }
+      }
+    }
+  
+  ## remove temps
+  df_XL$highway_name1 <- NULL
+  df_XL$highway_lat1 <- NULL
+  df_XL$highway_lng1 <- NULL
+  df_XL$highway_distance1 <- NULL
+  df_XL$highway_duration1 <- NULL
+  df_XL$highway_name2 <- NULL
+  df_XL$highway_lat2 <- NULL
+  df_XL$highway_lng2 <- NULL
+  df_XL$highway_distance2 <- NULL
+  df_XL$highway_duration2 <- NULL
+  
+  ## clean memory
+  remove(OUTPUT_google_duration)
+  
+```
+
+<br>
+
+### I. Nearest station
+
+First, obtain de (geo)location of the nearest train station through google API.
+
+```{r eval=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_google_places.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_nearest_station <- GET_google_places(lat = df_XL$lat,
+                                              lng = df_XL$lng,
+                                              places_type = "train_station")
+  
+  ## correct names
+  OUTPUT_nearest_station$name <- gsub(" railway station", "", OUTPUT_nearest_station$name)
+  
+  ## append data
+  df_XL$train_station_name <- OUTPUT_nearest_station$name
+  df_XL$train_station_lat <- OUTPUT_nearest_station$X_lat
+  df_XL$train_station_lng <- OUTPUT_nearest_station$X_lng
+  
+  ## clean memory
+  remove(OUTPUT_nearest_station)
+  
+  ### TO DO: waarom DH centraal rare naam?
+  
+```
+
+Second, we obtain additional data from our personal database. Mainly wheter the station is an *intercity station*.
+
+```{r eval=FALSE}  
+
+  ## establish db connection
+  db.trans <- odbcConnectAccess2007(file.path(wd.dir, "data", 'transportation.accdb'))
+
+  for(i in 1:nrow(df_XL)){
+    if(!is.na(df_XL$train_station_name[i])){
+    
+      ## query
+      query <- sprintf("SELECT * FROM train_stations WHERE train_station_name = '%s';", 
+                       as.character(df_XL$train_station_name[i]))
+      data <- sqlQuery(db.trans , query)
+      
+      ## append data
+      if(is.null(dim(data))) {
+      }else{
+      if(dim(data)[1] != 0) {
+        df_XL$train_station_intercity[i] <- TRUE
+      } else {
+        df_XL$train_station_intercity[i] <- FALSE
+      }
+      }
+      
+      ## clean memory
+      remove(query)
+      remove(data)
+    }
+  }
+
+  ## close connection
+  odbcClose(db.trans)
+  remove(db.trans)
+  
+```
+
+Last, we obtain info about the duration and distance:
+
+```{r eval=FALSE}  
+
+  ## set source of GET fuction
+  source(file.path(code.dir, 'GET_google_distances_duration.R'))
+
+  ## GET verblijfsobject data
+  OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$lat,
+                                                          lng_object = df_XL$lng,
+                                                          lat_place = df_XL$station_lat,
+                                                          lng_place = df_XL$station_lng,
+                                                          mode = "walking")
+  
+  ## append data
+  df_XL$train_station_distance <- OUTPUT_google_duration$distance
+  df_XL$train_station_duration <- OUTPUT_google_duration$duration
+  
+  ## clear memory
+  remove(OUTPUT_google_duration)
+  
+```
+
+Last, we get the centrality indicator
+
+```{r eval=FALSE}  
+
+  ## centrality
+  df_XL <- df_XL %>% rowwise() %>%
+           dplyr::mutate(centrality = ifelse(train_station_distance <= 400 & 
+                                             train_station_intercity %in% "TRUE", "central", "decentral"))
+
+```
+
+<br>
+
+### J. Other OV
+
+Other public transportation including bus, metro and tram.
+
+```{r eval=FALSE} 
+
+    ## Subway Station
+    source(file.path(code.dir, 'GET_google_places.R'))
+    OUTPUT_nearest_station <- GET_google_places(lat = df_XL$latitude,
+                                                lng = df_XL$longitude,
+                                                places_type = "subway_station")
+      df_XL$subway_station_name <- OUTPUT_nearest_station$name
+      df_XL$subway_station_lat <- OUTPUT_nearest_station$X_lat
+      df_XL$subway_station_lng <- OUTPUT_nearest_station$X_lng
+      
+    source(file.path(code.dir, 'GET_google_distances_duration.R'))
+    OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$latitude,
+                                                            lng_object = df_XL$longitude,
+                                                            lat_place = df_XL$subway_lat,
+                                                            lng_place = df_XL$subway_lng,
+                                                            mode = "walking")
+      df_XL$subway_station_distance <- OUTPUT_google_duration$distance
+      df_XL$subway_station_duration <- OUTPUT_google_duration$duration
+
+
+```
+
+```{r eval=FALSE} 
+
+    ## Bus Station
+    source(file.path(code.dir, 'GET_google_places.R'))
+    OUTPUT_nearest_station <- GET_google_places(lat = df_XL$latitude,
+                                                lng = df_XL$longitude,
+                                                places_type = "bus_station")
+      df_XL$bus_station_name <- OUTPUT_nearest_station$name
+      df_XL$bus_station_lat <- OUTPUT_nearest_station$X_lat
+      df_XL$bus_station_lng <- OUTPUT_nearest_station$X_lng
+      
+    source(file.path(code.dir, 'GET_google_distances_duration.R'))
+    OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$latitude,
+                                                            lng_object = df_XL$longitude,
+                                                            lat_place = df_XL$bus_station_lat,
+                                                            lng_place = df_XL$bus_station_lng,
+                                                            mode = "walking")
+      df_XL$bus_station_distance <- OUTPUT_google_duration$distance
+      df_XL$bus_station_duration <- OUTPUT_google_duration$duration
+
+```
+
+```{r eval=FALSE} 
+
+    ## Airport
+    source(file.path(code.dir, 'GET_google_places.R'))
+    OUTPUT_nearest_station <- GET_google_places(lat = df_XL$latitude,
+                                                lng = df_XL$longitude,
+                                                places_type = "airport")
+      df_XL$airport_name <- OUTPUT_nearest_station$name
+      df_XL$airport_lat <- OUTPUT_nearest_station$X_lat
+      df_XL$airport_lng <- OUTPUT_nearest_station$X_lng
+      
+    source(file.path(code.dir, 'GET_google_distances_duration.R'))
+    OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$latitude,
+                                                            lng_object = df_XL$longitude,
+                                                            lat_place = df_XL$airport_lat,
+                                                            lng_place = df_XL$airport_lng,
+                                                            mode = "drivint")
+      df_XL$airport_distance <- OUTPUT_google_duration$distance
+      df_XL$airport_duration <- OUTPUT_google_duration$duration
+
+```
+
+```{r eval=FALSE} 
+
+    ## Transit station
+    source(file.path(code.dir, 'GET_google_places.R'))
+    OUTPUT_nearest_station <- GET_google_places(lat = df_XL$latitude,
+                                                lng = df_XL$longitude,
+                                                places_type = "transit_station")
+      df_XL$transit_station_name <- OUTPUT_nearest_station$name
+      df_XL$transit_station_lat <- OUTPUT_nearest_station$X_lat
+      df_XL$transit_station_lng <- OUTPUT_nearest_station$X_lng
+      
+    source(file.path(code.dir, 'GET_google_distances_duration.R'))
+    OUTPUT_google_duration <- GET_google_distances_duration(lat_object = df_XL$latitude,
+                                                            lng_object = df_XL$longitude,
+                                                            lat_place = df_XL$transit_station_lat,
+                                                            lng_place = df_XL$transit_station_lng,
+                                                            mode = "walking")
+      df_XL$transit_station_distance <- OUTPUT_google_duration$distance
+      df_XL$transit_station_duration <- OUTPUT_google_duration$duration
+      
+
+```
+
+<br>
+
+---
+
+# 3. STORE DATA
+
+<br>
+
+And save to database
+
+```{r eval=FALSE}
+
+  try(sqlDrop(db.conn, "tbl1_data_gathered", errors = TRUE))
+  sqlSave(db.conn, df_XL, tablename = "tbl1_data_gathered", append = FALSE,
+          rownames = FALSE, colnames = FALSE, nastring = "") # cannot use NA in Access for numeric fields
+
+```
+
+Lastly, we close the database connection.
+
+```{r eval=FALSE}
+
+  odbcClose(db.conn)
+  odbcCloseAll()
+  remove(db.conn)
+  
+  # clean workspace
+  rm(list = ls())
+
+```
+
+<br>
+
+---
+
+> Go back to [top](#top)
